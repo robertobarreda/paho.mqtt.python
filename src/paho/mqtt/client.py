@@ -331,7 +331,7 @@ class MQTTPacket(object):
     """ This is a class that describes an incoming or outgoing packet
     """
     __slots__ = ('command', 'have_remaining', 'remaining_count',
-                 'remaining_mult', 'remaining_length', 'packet', 'to_process')
+                 'remaining_mult', 'remaining_length', 'to_process', 'payload')
 
     def __init__(self):
         self.command = 0
@@ -339,8 +339,8 @@ class MQTTPacket(object):
         self.remaining_count = []
         self.remaining_mult = 1
         self.remaining_length = 0
-        self.packet = b""
         self.to_process = 0
+        self.payload = b""
 
 
 class MQTTTransportException(Exception):
@@ -1184,7 +1184,7 @@ class Client(object):
 
         Do not use if you are using the threaded interface loop_start()."""
         if self._sock is None:
-            return MQTT_ERR_NO_CONN
+            raise gen.Return(MQTT_ERR_NO_CONN)
 
         max_packets = len(self._out_messages) + len(self._in_messages)
         if max_packets < 1:
@@ -1193,10 +1193,11 @@ class Client(object):
         for i in range(0, max_packets):
             rc = self._packet_read()
             if rc > 0:
-                return self._loop_rc_handle(rc)
+                raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
-                return MQTT_ERR_SUCCESS
-        return MQTT_ERR_SUCCESS
+                raise gen.Return(MQTT_ERR_SUCCESS)
+
+        raise gen.Return(MQTT_ERR_SUCCESS)
 
     @gen.coroutine
     def loop_write(self, max_packets=1):
@@ -1210,7 +1211,7 @@ class Client(object):
 
         Do not use if you are using the threaded interface loop_start()."""
         if self._sock is None:
-            return MQTT_ERR_NO_CONN
+            raise gen.Return(MQTT_ERR_NO_CONN)
 
         max_packets = len(self._out_packet) + 1
         if max_packets < 1:
@@ -1219,19 +1220,17 @@ class Client(object):
         for i in range(0, max_packets):
             rc = self._packet_write()
             if rc > 0:
-                return self._loop_rc_handle(rc)
+                raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
-                return MQTT_ERR_SUCCESS
-        return MQTT_ERR_SUCCESS
+                raise gen.Return(MQTT_ERR_SUCCESS)
+
+        raise gen.Return(MQTT_ERR_SUCCESS)
 
     def want_write(self):
         """Call to determine if there is network data waiting to be written.
         Useful if you are calling select() yourself rather than using loop().
         """
-        if self._current_out_packet or len(self._out_packet) > 0:
-            return True
-        else:
-            return False
+        return self._current_out_packet or len(self._out_packet) > 0
 
     def loop_misc(self):
         """Process miscellaneous network events. Use in place of calling loop() if you
@@ -1447,6 +1446,13 @@ class Client(object):
         if threading.current_thread() != self._thread:
             self._thread.join()
             self._thread = None
+
+    def start(self):
+        self.io_loop.spawn_callback(self.loop_forever)
+        self.io_loop.start()
+
+    def stop(self):
+        self.io_loop.stop()
 
     @property
     def on_log(self):
@@ -1711,7 +1717,7 @@ class Client(object):
             with io_exception_context(self):
                 command = yield self._read_bytes(1)
                 if len(command) == 0:
-                    return 1
+                    raise gen.Return(1)
                 command = struct.unpack("!B", command)
                 packet.command = command[0]
 
@@ -1719,26 +1725,17 @@ class Client(object):
             # Algorithm for decoding taken from pseudo code at
             # http://publib.boulder.ibm.com/infocenter/wmbhelp/v6r0m0/topic/com.ibm.etools.mft.doc/ac10870_.htm
             while True:
-                try:
-                    byte = yield self._read_bytes(1)
-                except socket.error as err:
-                    if self._ssl and (err.errno == ssl.SSL_ERROR_WANT_READ or err.errno == ssl.SSL_ERROR_WANT_WRITE):
-                        return MQTT_ERR_AGAIN
-                    if err.errno == EAGAIN:
-                        return MQTT_ERR_AGAIN
-                    print(err)
-                    return 1
-                else:
-                    byte = struct.unpack("!B", byte)
-                    byte = byte[0]
-                    packet.remaining_count.append(byte)
-                    # Max 4 bytes length for remaining length as defined by protocol.
-                        # Anything more likely means a broken/malicious client.
-                    if len(packet.remaining_count) > 4:
-                        return MQTT_ERR_PROTOCOL
+                byte = yield self._read_bytes(1)
+                byte = struct.unpack("!B", byte)
+                byte = byte[0]
+                packet.remaining_count.append(byte)
+                # Max 4 bytes length for remaining length as defined by protocol.
+                # Anything more likely means a broken/malicious client.
+                if len(packet.remaining_count) > 4:
+                    raise gen.Return(MQTT_ERR_PROTOCOL)
 
-                    packet.remaining_length = packet.remaining_length + (byte & 127)*packet.remaining_mult
-                    packet.remaining_mult = packet.remaining_mult * 128
+                packet.remaining_length = packet.remaining_length + (byte & 127) * packet.remaining_mult
+                packet.remaining_mult = packet.remaining_mult * 128
 
                 if (byte & 128) == 0:
                     break
@@ -1747,18 +1744,9 @@ class Client(object):
             packet.to_process = packet.remaining_length
 
             while packet.to_process > 0:
-                try:
-                    data = yield self._read_bytes(packet.to_process)
-                except socket.error as err:
-                    if self._ssl and (err.errno == ssl.SSL_ERROR_WANT_READ or err.errno == ssl.SSL_ERROR_WANT_WRITE):
-                        return MQTT_ERR_AGAIN
-                    if err.errno == EAGAIN:
-                        return MQTT_ERR_AGAIN
-                    print(err)
-                    return 1
-                else:
-                    packet.to_process = packet.to_process - len(data)
-                    packet.packet = packet.packet + data
+                data = yield self._read_bytes(packet.to_process)
+                packet.to_process -= len(data)
+                packet.payload += data
 
         # All data for this packet is read.
         rc = self._packet_handle(packet)
@@ -1767,70 +1755,50 @@ class Client(object):
         self._last_msg_in = time_func()
         self._msgtime_mutex.release()
 
-        return rc
+        raise gen.Return(rc)
 
+    @gen.coroutine
     def _packet_write(self):
         self._current_out_packet_mutex.acquire()
 
         while self._current_out_packet:
             packet = self._current_out_packet
 
-            try:
-                write_length = self._sock.send(packet['packet'][packet['pos']:])
-            except (AttributeError, ValueError):
+            yield self._write(packet.payload)
+
+            if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
+                self._callback_mutex.acquire()
+                if self.on_publish:
+                    self._in_callback = True
+                    self.on_publish(self, self._userdata, packet.mid)
+                    self._in_callback = False
+                self._callback_mutex.release()
+
+                packet.info._set_as_published()
+
+            if (packet.command & 0xF0) == DISCONNECT:
                 self._current_out_packet_mutex.release()
-                return MQTT_ERR_SUCCESS
-            except socket.error as err:
-                self._current_out_packet_mutex.release()
-                if self._ssl and (err.errno == ssl.SSL_ERROR_WANT_READ or err.errno == ssl.SSL_ERROR_WANT_WRITE):
-                    return MQTT_ERR_AGAIN
-                if err.errno == EAGAIN:
-                    return MQTT_ERR_AGAIN
-                print(err)
-                return 1
 
-            if write_length > 0:
-                packet['to_process'] = packet['to_process'] - write_length
-                packet['pos'] = packet['pos'] + write_length
+                self._msgtime_mutex.acquire()
+                self._last_msg_out = time_func()
+                self._msgtime_mutex.release()
 
-                if packet['to_process'] == 0:
-                    if (packet['command'] & 0xF0) == PUBLISH and packet['qos'] == 0:
-                        self._callback_mutex.acquire()
-                        if self.on_publish:
-                            self._in_callback = True
-                            self.on_publish(self, self._userdata, packet['mid'])
-                            self._in_callback = False
-                        self._callback_mutex.release()
+                self._callback_mutex.acquire()
+                if self.on_disconnect:
+                    self._in_callback = True
+                    self.on_disconnect(self, self._userdata, 0)
+                    self._in_callback = False
+                self._callback_mutex.release()
 
-                        packet['info']._set_as_published()
+                self.close()
+                raise gen.Return(MQTT_ERR_SUCCESS)
 
-                    if (packet['command'] & 0xF0) == DISCONNECT:
-                        self._current_out_packet_mutex.release()
-
-                        self._msgtime_mutex.acquire()
-                        self._last_msg_out = time_func()
-                        self._msgtime_mutex.release()
-
-                        self._callback_mutex.acquire()
-                        if self.on_disconnect:
-                            self._in_callback = True
-                            self.on_disconnect(self, self._userdata, 0)
-                            self._in_callback = False
-                        self._callback_mutex.release()
-
-                        if self._sock:
-                            self._sock.close()
-                            self._sock = None
-                        return MQTT_ERR_SUCCESS
-
-                    self._out_packet_mutex.acquire()
-                    if len(self._out_packet) > 0:
-                        self._current_out_packet = self._out_packet.pop(0)
-                    else:
-                        self._current_out_packet = None
-                    self._out_packet_mutex.release()
+            self._out_packet_mutex.acquire()
+            if len(self._out_packet) > 0:
+                self._current_out_packet = self._out_packet.pop(0)
             else:
-                break
+                self._current_out_packet = None
+            self._out_packet_mutex.release()
 
         self._current_out_packet_mutex.release()
 
@@ -1838,7 +1806,7 @@ class Client(object):
         self._last_msg_out = time_func()
         self._msgtime_mutex.release()
 
-        return MQTT_ERR_SUCCESS
+        raise gen.Return(MQTT_ERR_SUCCESS)
 
     def _easy_log(self, level, fmt, *args):
         if self.on_log:
@@ -1865,9 +1833,7 @@ class Client(object):
                 self._last_msg_in = now
                 self._msgtime_mutex.release()
             else:
-                if self._sock:
-                    self._sock.close()
-                    self._sock = None
+                self.close()
 
                 if self._state == mqtt_cs_disconnecting:
                     rc = MQTT_ERR_SUCCESS
@@ -2224,7 +2190,8 @@ class Client(object):
             pos = 0,
             to_process = len(packet),
             packet = packet,
-            info = info)
+            info = info
+        )
 
         self._out_packet_mutex.acquire()
         self._out_packet.append(mpkt)
@@ -2297,10 +2264,10 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        if len(packet.packet) != 2:
+        if len(packet.payload) != 2:
             return MQTT_ERR_PROTOCOL
 
-        (flags, result) = struct.unpack("!BB", packet.packet)
+        (flags, result) = struct.unpack("!BB", packet.payload)
         if result == CONNACK_REFUSED_PROTOCOL_VERSION and self._protocol == MQTTv311:
             self._easy_log(
                 MQTT_LOG_DEBUG,
@@ -2388,8 +2355,8 @@ class Client(object):
 
     def _handle_suback(self, packet):
         self._easy_log(MQTT_LOG_DEBUG, "Received SUBACK")
-        pack_format = "!H" + str(len(packet.packet)-2) + 's'
-        (mid, packet) = struct.unpack(pack_format, packet.packet)
+        pack_format = "!H" + str(len(packet.payload)-2) + 's'
+        (mid, packet) = struct.unpack(pack_format, packet.payload)
         pack_format = "!" + "B"*len(packet)
         granted_qos = struct.unpack(pack_format, packet)
 
@@ -2411,8 +2378,8 @@ class Client(object):
         message.qos = (header & 0x06)>>1
         message.retain = (header & 0x01)
 
-        pack_format = "!H" + str(len(packet.packet)-2) + 's'
-        (slen, packet) = struct.unpack(pack_format, packet.packet)
+        pack_format = "!H" + str(len(packet.payload)-2) + 's'
+        (slen, packet) = struct.unpack(pack_format, packet.payload)
         pack_format = '!' + str(slen) + 's' + str(len(packet)-slen) + 's'
         (message.topic, packet) = struct.unpack(pack_format, packet)
 
@@ -2458,10 +2425,10 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        if len(packet.packet) != 2:
+        if len(packet.payload) != 2:
             return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.packet)
+        mid = struct.unpack("!H", packet.payload)
         mid = mid[0]
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREL (Mid: %d)", mid)
 
@@ -2510,7 +2477,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.packet)
+        mid = struct.unpack("!H", packet.payload)
         mid = mid[0]
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREC (Mid: %d)", mid)
 
@@ -2530,7 +2497,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.packet)
+        mid = struct.unpack("!H", packet.payload)
         mid = mid[0]
         self._easy_log(MQTT_LOG_DEBUG, "Received UNSUBACK (Mid: %d)", mid)
         self._callback_mutex.acquire()
@@ -2565,7 +2532,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.packet)
+        mid = struct.unpack("!H", packet.payload)
         mid = mid[0]
         self._easy_log(MQTT_LOG_DEBUG, "Received %s (Mid: %d)", cmd, mid)
 

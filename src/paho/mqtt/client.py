@@ -20,7 +20,6 @@ import contextlib
 import errno
 import platform
 import random
-import select
 import socket
 HAVE_SSL = True
 try:
@@ -256,7 +255,7 @@ class MQTTMessageInfo(object):
     def __init__(self, mid):
         self.mid = mid
         self._published = False
-        self._condition = threading.Condition()
+        self._condition = locks.Condition()
         self.rc = 0
         self._iterpos = 0
 
@@ -531,7 +530,6 @@ class Client(object):
         self._username = None
         self._password = None
         self._out_packet = Queue()
-        self._current_out_packet = None
         self._last_msg_in = time_func()
         self._last_msg_out = time_func()
         self._ping_t = 0
@@ -555,8 +553,6 @@ class Client(object):
         self._strict_protocol = False
         self._callback_mutex = threading.RLock()
         self._state_mutex = threading.Lock()
-        self._out_packet_mutex = threading.Lock()
-        self._current_out_packet_mutex = threading.Lock()
         self._msgtime_mutex = threading.Lock()
         self._out_message_mutex = threading.Lock()
         self._in_message_mutex = threading.Lock()
@@ -807,9 +803,7 @@ class Client(object):
         if self._port <= 0:
             raise ValueError('Invalid port number.')
 
-        self._out_packet_mutex.acquire()
         self._out_packet = Queue()
-        self._out_packet_mutex.release()
 
         self._msgtime_mutex.acquire()
         self._last_msg_in = time_func()
@@ -883,53 +877,12 @@ class Client(object):
         if timeout < 0.0:
             raise ValueError('Invalid timeout.')
 
-        self._current_out_packet_mutex.acquire()
-        self._out_packet_mutex.acquire()
-        if self._current_out_packet is None and len(self._out_packet) > 0:
-            self._current_out_packet = self._out_packet.popleft()
-
-        if self._current_out_packet:
-            wlist = [self._sock]
-        else:
-            wlist = []
-        self._out_packet_mutex.release()
-        self._current_out_packet_mutex.release()
-
-        # sockpairR is used to break out of select() before the timeout, on a
-        # call to publish() etc.
-        rlist = [self._sock, self._sockpairR]
-        try:
-            socklist = select.select(rlist, wlist, [], timeout)
-        except TypeError:
-            # Socket isn't correct type, in likelihood connection is lost
-            return MQTT_ERR_CONN_LOST
-        except ValueError:
-            # Can occur if we just reconnected but rlist/wlist contain a -1 for
-            # some reason.
-            return MQTT_ERR_CONN_LOST
-        except KeyboardInterrupt:
-            # Allow ^C to interrupt
-            raise
-        except:
-            return MQTT_ERR_UNKNOWN
-
-        if self._sock in socklist[0]:
+        if self._sock:
             rc = self.loop_read(max_packets)
             if rc or self._sock is None:
                 return rc
 
-        if self._sockpairR in socklist[0]:
-            # Stimulate output write even though we didn't ask for it, because
-            # at that point the publish or other command wasn't present.
-            socklist[1].insert(0, self._sock)
-            # Clear sockpairR - only ever a single byte written.
-            try:
-                self._sockpairR.recv(1)
-            except socket.error as err:
-                if err.errno != EAGAIN:
-                    raise
-
-        if self._sock in socklist[1]:
+        if self._sock:
             rc = self.loop_write(max_packets)
             if rc or self._sock is None:
                 return rc
@@ -1195,7 +1148,7 @@ class Client(object):
             max_packets = 1
 
         for _ in range(0, max_packets):
-            rc = self._packet_read()
+            rc = yield self._packet_read()
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1217,12 +1170,14 @@ class Client(object):
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
-        max_packets = len(self._out_packet) + 1
+        max_packets = self._out_packet.qsize() + 1
         if max_packets < 1:
             max_packets = 1
 
         for _ in range(0, max_packets):
-            rc = self._packet_write()
+            packet = yield self._out_packet.get()
+            rc = yield self._packet_write(packet)
+            self._out_packet.task_done()
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1234,7 +1189,7 @@ class Client(object):
         """Call to determine if there is network data waiting to be written.
         Useful if you are calling select() yourself rather than using loop().
         """
-        return self._current_out_packet or len(self._out_packet) > 0
+        return self._out_packet.qsize() > 0
 
     def loop_misc(self):
         """Process miscellaneous network events. Use in place of calling loop() if you
@@ -1397,8 +1352,7 @@ class Client(object):
                 # so no other threads can access _current_out_packet,
                 # _out_packet or _messages.
                 if (self._thread_terminate is True
-                        and self._current_out_packet is None
-                        and len(self._out_packet) == 0
+                        and self._out_packet.qsize() == 0
                         and len(self._out_messages) == 0):
 
                     rc = 1
@@ -1667,9 +1621,7 @@ class Client(object):
 
     def _loop_rc_handle(self, rc):
         if rc:
-            if self._sock:
-                self._sock.close()
-                self._sock = None
+            self.close()
 
             self._state_mutex.acquire()
             if self._state == mqtt_cs_disconnecting:
@@ -1763,49 +1715,34 @@ class Client(object):
         raise gen.Return(rc)
 
     @gen.coroutine
-    def _packet_write(self):
-        self._current_out_packet_mutex.acquire()
-
-        while self._current_out_packet:
-            packet = self._current_out_packet
-
+    def _packet_write(self, packet):
+        with io_exception_context(self):
             yield self._write(packet.payload)
 
-            if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
-                self._callback_mutex.acquire()
-                if self.on_publish:
-                    self._in_callback = True
-                    self.on_publish(self, self._userdata, packet.mid)
-                    self._in_callback = False
-                self._callback_mutex.release()
+        if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
+            self._callback_mutex.acquire()
+            if self.on_publish:
+                self._in_callback = True
+                self.on_publish(self, self._userdata, packet.mid)
+                self._in_callback = False
+            self._callback_mutex.release()
 
-                packet.info._set_as_published()
+            packet.info._set_as_published()
 
-            if (packet.command & 0xF0) == DISCONNECT:
-                self._current_out_packet_mutex.release()
+        if (packet.command & 0xF0) == DISCONNECT:
+            self._msgtime_mutex.acquire()
+            self._last_msg_out = time_func()
+            self._msgtime_mutex.release()
 
-                self._msgtime_mutex.acquire()
-                self._last_msg_out = time_func()
-                self._msgtime_mutex.release()
+            self._callback_mutex.acquire()
+            if self.on_disconnect:
+                self._in_callback = True
+                self.on_disconnect(self, self._userdata, 0)
+                self._in_callback = False
+            self._callback_mutex.release()
 
-                self._callback_mutex.acquire()
-                if self.on_disconnect:
-                    self._in_callback = True
-                    self.on_disconnect(self, self._userdata, 0)
-                    self._in_callback = False
-                self._callback_mutex.release()
-
-                self.close()
-                raise gen.Return(MQTT_ERR_SUCCESS)
-
-            self._out_packet_mutex.acquire()
-            if len(self._out_packet) > 0:
-                self._current_out_packet = self._out_packet.pop(0)
-            else:
-                self._current_out_packet = None
-            self._out_packet_mutex.release()
-
-        self._current_out_packet_mutex.release()
+            self.close()
+            raise gen.Return(MQTT_ERR_SUCCESS)
 
         self._msgtime_mutex.acquire()
         self._last_msg_out = time_func()
@@ -2149,21 +2086,7 @@ class Client(object):
         mpkt.mid = mid
         mpkt.qos = qos
 
-        self._out_packet_mutex.acquire()
-        self._out_packet.append(mpkt)
-        if self._current_out_packet_mutex.acquire(False):
-            if self._current_out_packet is None and len(self._out_packet) > 0:
-                self._current_out_packet = self._out_packet.popleft()
-            self._current_out_packet_mutex.release()
-        self._out_packet_mutex.release()
-
-        # Write a single byte to sockpairW (connected to sockpairR) to break
-        # out of select() if in threaded mode.
-        try:
-            self._sockpairW.send(sockpair_data)
-        except socket.error as err:
-            if err.errno != EAGAIN:
-                raise
+        self._out_packet.put_nowait(mpkt)
 
         if not self._in_callback and self._thread is None:
             return self.loop_write()
@@ -2262,7 +2185,7 @@ class Client(object):
             for m in self._out_messages:
                 m.timestamp = time_func()
                 if m.state == mqtt_ms_queued:
-                    self.loop_write() # Process outgoing messages that have just been queued up
+                    self.loop_write()  # Process outgoing messages that have just been queued up
                     self._out_message_mutex.release()
                     return MQTT_ERR_SUCCESS
 

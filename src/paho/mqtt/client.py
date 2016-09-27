@@ -17,6 +17,7 @@ This is an MQTT v3.1 client module. MQTT is a lightweight pub/sub messaging
 protocol that is easy to implement and suitable for low powered devices.
 """
 import contextlib
+import collections
 import errno
 import platform
 import random
@@ -77,6 +78,11 @@ MQTTv311 = 4
 
 PROTOCOL_NAMEv31 = "MQIsdp"
 PROTOCOL_NAMEv311 = "MQTT"
+
+# define some alias for python2 compatibility
+unicode = str
+basestring = str
+
 
 # Message types
 CONNECT = 0x10
@@ -196,17 +202,17 @@ def error_string(mqtt_errno):
 
 def connack_string(connack_code):
     """Return the string associated with a CONNACK result."""
-    if connack_code == 0:
+    if connack_code == CONNACK_ACCEPTED:
         return "Connection Accepted."
-    elif connack_code == 1:
+    elif connack_code == CONNACK_REFUSED_PROTOCOL_VERSION:
         return "Connection Refused: unacceptable protocol version."
-    elif connack_code == 2:
+    elif connack_code == CONNACK_REFUSED_IDENTIFIER_REJECTED:
         return "Connection Refused: identifier rejected."
-    elif connack_code == 3:
+    elif connack_code == CONNACK_REFUSED_SERVER_UNAVAILABLE:
         return "Connection Refused: broker unavailable."
-    elif connack_code == 4:
+    elif connack_code == CONNACK_REFUSED_BAD_USERNAME_PASSWORD:
         return "Connection Refused: bad user name or password."
-    elif connack_code == 5:
+    elif connack_code == CONNACK_REFUSED_NOT_AUTHORIZED:
         return "Connection Refused: not authorised."
     else:
         return "Connection Refused: unknown reason."
@@ -245,7 +251,8 @@ class MQTTMessageInfo(object):
     out the mid of the message that was published, and to determine whether the
     message has been published, and/or wait until it is published.
     """
-    __slots__ = ('mid', 'rc', '_published', '_condition', '_iterpos')
+
+    __slots__ = 'mid', '_published', '_condition', 'rc', '_iterpos'
 
     def __init__(self, mid):
         self.mid = mid
@@ -312,16 +319,16 @@ class MQTTMessage(object):
     retain : Boolean. If true, the message is a retained message and not fresh.
     mid : Integer. The message id.
     """
-    __slots__ = ('timestamp', 'state', 'dup', 'mid', 'topic', 'payload', 'qos',
-                 'retain', 'info')
 
-    def __init__(self, mid=0, topic=""):
+    __slots__ = 'timestamp', 'state', 'dup', 'mid', 'topic', 'payload', 'qos', 'retain', 'info'
+
+    def __init__(self, mid=0, topic=b""):
         self.timestamp = 0
         self.state = mqtt_ms_invalid
         self.dup = False
         self.mid = mid
         self.topic = topic
-        self.payload = None
+        self.payload = b""
         self.qos = 0
         self.retain = False
         self.info = MQTTMessageInfo(mid)
@@ -518,13 +525,16 @@ class Client(object):
             if protocol == MQTTv31:
                 self._client_id = base62(uuid.uuid4().int, padding=22)
             else:
-                self._client_id = ""
+                self._client_id = b""
         else:
             self._client_id = client_id
+        if isinstance(self._client_id, unicode):
+            self._client_id = self._client_id.encode('utf-8')
 
         self._username = None
         self._password = None
         self._out_packet = Queue()
+        self._current_out_packet = None
         self._last_msg_in = time_func()
         self._last_msg_out = time_func()
         self._ping_t = 0
@@ -536,8 +546,8 @@ class Client(object):
         self._inflight_messages = 0
         self._max_queued_messages = 0
         self._will = False
-        self._will_topic = ""
-        self._will_payload = None
+        self._will_topic = b""
+        self._will_payload = b""
         self._will_qos = 0
         self._will_retain = False
         self._on_message_filtered = MQTTMatcher()
@@ -879,7 +889,7 @@ class Client(object):
         self._current_out_packet_mutex.acquire()
         self._out_packet_mutex.acquire()
         if self._current_out_packet is None and len(self._out_packet) > 0:
-            self._current_out_packet = self._out_packet.pop(0)
+            self._current_out_packet = self._out_packet.popleft()
 
         if self._current_out_packet:
             wlist = [self._sock]
@@ -965,26 +975,28 @@ class Client(object):
         the length of the payload is greater than 268435455 bytes."""
         if topic is None or len(topic) == 0:
             raise ValueError('Invalid topic.')
-        if qos<0 or qos>2:
-            raise ValueError('Invalid QoS level.')
-        if isinstance(payload, str) or isinstance(payload, bytearray):
-            local_payload = payload
-        elif sys.version_info[0] == 3 and isinstance(payload, bytes):
-            local_payload = bytearray(payload)
-        elif sys.version_info[0] < 3 and isinstance(payload, unicode):
-            local_payload = payload
-        elif isinstance(payload, int) or isinstance(payload, float):
-            local_payload = str(payload)
-        elif payload is None:
-            local_payload = None
-        else:
-            raise TypeError('payload must be a string, bytearray, int, float or None.')
 
-        if local_payload is not None and len(local_payload) > 268435455:
-            raise ValueError('Payload too large.')
+        topic = topic.encode('utf-8')
 
         if self._topic_wildcard_len_check(topic) != MQTT_ERR_SUCCESS:
             raise ValueError('Publish topic cannot contain wildcards.')
+
+        if qos < 0 or qos > 2:
+            raise ValueError('Invalid QoS level.')
+
+        if isinstance(payload, unicode):
+            local_payload = payload.encode('utf-8')
+        elif isinstance(payload, (bytes, bytearray)):
+            local_payload = payload
+        elif isinstance(payload, (int, float)):
+            local_payload = str(payload).encode('ascii')
+        elif payload is None:
+            local_payload = b''
+        else:
+            raise TypeError('payload must be a string, bytearray, int, float or None.')
+
+        if len(local_payload) > 268435455:
+            raise ValueError('Payload too large.')
 
         local_mid = self._mid_generate()
 
@@ -996,12 +1008,7 @@ class Client(object):
         else:
             message = MQTTMessage(local_mid, topic)
             message.timestamp = time_func()
-
-            if local_payload is None or len(local_payload) == 0:
-                message.payload = None
-            else:
-                message.payload = local_payload
-
+            message.payload = local_payload
             message.qos = qos
             message.retain = retain
             message.dup = False
@@ -1014,7 +1021,7 @@ class Client(object):
 
             self._out_messages.append(message)
             if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
-                self._inflight_messages = self._inflight_messages+1
+                self._inflight_messages += 1
                 if qos == 1:
                     message.state = mqtt_ms_wait_for_puback
                 elif qos == 2:
@@ -1048,6 +1055,8 @@ class Client(object):
         """
         self._username = username.encode('utf-8')
         self._password = password
+        if isinstance(self._password, unicode):
+            self._password = self._password.encode('utf-8')
 
     def disconnect(self):
         """Disconnect a connected client from the broker."""
@@ -1104,26 +1113,24 @@ class Client(object):
         zero string length, or if topic is not a string, tuple or list.
         """
         topic_qos_list = None
-        if isinstance(topic, str) or (sys.version_info[0] == 2 and isinstance(topic, unicode)):
-            if qos<0 or qos>2:
+
+        if isinstance(topic, tuple):
+            topic, qos = topic
+
+        if isinstance(topic, basestring):
+            if qos < 0 or qos > 2:
                 raise ValueError('Invalid QoS level.')
             if topic is None or len(topic) == 0:
                 raise ValueError('Invalid topic.')
             topic_qos_list = [(topic.encode('utf-8'), qos)]
-        elif isinstance(topic, tuple):
-            if topic[1]<0 or topic[1]>2:
-                raise ValueError('Invalid QoS level.')
-            if topic[0] is None or len(topic[0]) == 0 or not isinstance(topic[0], str):
-                raise ValueError('Invalid topic.')
-            topic_qos_list = [(topic[0].encode('utf-8'), topic[1])]
         elif isinstance(topic, list):
             topic_qos_list = []
-            for t in topic:
-                if t[1]<0 or t[1]>2:
+            for t, q in topic:
+                if q < 0 or q > 2:
                     raise ValueError('Invalid QoS level.')
-                if t[0] is None or len(t[0]) == 0 or not isinstance(t[0], str):
+                if t is None or len(t) == 0 or not isinstance(t, basestring):
                     raise ValueError('Invalid topic.')
-                topic_qos_list.append((t[0].encode('utf-8'), t[1]))
+                topic_qos_list.append((t.encode('utf-8'), q))
 
         if topic_qos_list is None:
             raise ValueError("No topic specified, or incorrect topic type.")
@@ -1155,14 +1162,14 @@ class Client(object):
         topic_list = None
         if topic is None:
             raise ValueError('Invalid topic.')
-        if isinstance(topic, str):
+        if isinstance(topic, basestring):
             if len(topic) == 0:
                 raise ValueError('Invalid topic.')
             topic_list = [topic.encode('utf-8')]
         elif isinstance(topic, list):
             topic_list = []
             for t in topic:
-                if len(t) == 0 or not isinstance(t, str):
+                if len(t) == 0 or not isinstance(t, basestring):
                     raise ValueError('Invalid topic.')
                 topic_list.append(t.encode('utf-8'))
 
@@ -1190,7 +1197,7 @@ class Client(object):
         if max_packets < 1:
             max_packets = 1
 
-        for i in range(0, max_packets):
+        for _ in range(0, max_packets):
             rc = self._packet_read()
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
@@ -1201,8 +1208,8 @@ class Client(object):
 
     @gen.coroutine
     def loop_write(self, max_packets=1):
-        """Process read network events. Use in place of calling loop() if you
-        wish to handle your client reads as part of your own application.
+        """Process write network events. Use in place of calling loop() if you
+        wish to handle your client writes as part of your own application.
 
         Use socket() to obtain the client socket to call select() or equivalent
         on.
@@ -1217,7 +1224,7 @@ class Client(object):
         if max_packets < 1:
             max_packets = 1
 
-        for i in range(0, max_packets):
+        for _ in range(0, max_packets):
             rc = self._packet_write()
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
@@ -1315,16 +1322,18 @@ class Client(object):
         """
         if topic is None or len(topic) == 0:
             raise ValueError('Invalid topic.')
-        if qos<0 or qos>2:
+
+        if qos < 0 or qos > 2:
             raise ValueError('Invalid QoS level.')
-        if isinstance(payload, str):
+
+        if isinstance(payload, unicode):
             self._will_payload = payload.encode('utf-8')
-        elif isinstance(payload, bytearray):
+        elif isinstance(payload, (bytes, bytearray)):
             self._will_payload = payload
-        elif isinstance(payload, int) or isinstance(payload, float):
-            self._will_payload = str(payload)
+        elif isinstance(payload, (int, float)):
+            self._will_payload = str(payload).encode('ascii')
         elif payload is None:
-            self._will_payload = None
+            self._will_payload = b""
         else:
             raise TypeError('payload must be a string, bytearray, int, float or None.')
 
@@ -1338,8 +1347,8 @@ class Client(object):
 
         Must be called before connect() to have any effect."""
         self._will = False
-        self._will_topic = ""
-        self._will_payload = None
+        self._will_topic = b""
+        self._will_payload = b""
         self._will_qos = 0
         self._will_retain = False
 
@@ -1718,35 +1727,34 @@ class Client(object):
                 command = yield self._read_bytes(1)
                 if len(command) == 0:
                     raise gen.Return(1)
-                command = struct.unpack("!B", command)
+                command, = struct.unpack("!B", command)
                 packet.command = command[0]
 
-            # Read remaining
-            # Algorithm for decoding taken from pseudo code at
-            # http://publib.boulder.ibm.com/infocenter/wmbhelp/v6r0m0/topic/com.ibm.etools.mft.doc/ac10870_.htm
-            while True:
-                byte = yield self._read_bytes(1)
-                byte = struct.unpack("!B", byte)
-                byte = byte[0]
-                packet.remaining_count.append(byte)
-                # Max 4 bytes length for remaining length as defined by protocol.
-                # Anything more likely means a broken/malicious client.
-                if len(packet.remaining_count) > 4:
-                    raise gen.Return(MQTT_ERR_PROTOCOL)
+                # Read remaining
+                # Algorithm for decoding taken from pseudo code at
+                # http://publib.boulder.ibm.com/infocenter/wmbhelp/v6r0m0/topic/com.ibm.etools.mft.doc/ac10870_.htm
+                while True:
+                    byte = yield self._read_bytes(1)
+                    byte, = struct.unpack("!B", byte)
+                    packet.remaining_count.append(byte)
+                    # Max 4 bytes length for remaining length as defined by protocol.
+                    # Anything more likely means a broken/malicious client.
+                    if len(packet.remaining_count) > 4:
+                        raise gen.Return(MQTT_ERR_PROTOCOL)
 
-                packet.remaining_length = packet.remaining_length + (byte & 127) * packet.remaining_mult
-                packet.remaining_mult = packet.remaining_mult * 128
+                    packet.remaining_length += (byte & 127) * packet.remaining_mult
+                    packet.remaining_mult *= 128
 
-                if (byte & 128) == 0:
-                    break
+                    if (byte & 128) == 0:
+                        break
 
-            packet.have_remaining = 1
-            packet.to_process = packet.remaining_length
+                packet.have_remaining = 1
+                packet.to_process = packet.remaining_length
 
-            while packet.to_process > 0:
-                data = yield self._read_bytes(packet.to_process)
-                packet.to_process -= len(data)
-                packet.payload += data
+                while packet.to_process > 0:
+                    data = yield self._read_bytes(packet.to_process)
+                    packet.to_process -= len(data)
+                    packet.payload += data
 
         # All data for this packet is read.
         rc = self._packet_handle(packet)
@@ -1847,7 +1855,7 @@ class Client(object):
                 self._callback_mutex.release()
 
     def _mid_generate(self):
-        self._last_mid = self._last_mid + 1
+        self._last_mid += 1
         if self._last_mid == 65536:
             self._last_mid = 1
         return self._last_mid
@@ -1857,7 +1865,7 @@ class Client(object):
         # Search for + or # in a topic. Return MQTT_ERR_INVAL if found.
          # Also returns MQTT_ERR_INVAL if the topic string is too long.
          # Returns MQTT_ERR_SUCCESS if everything is fine.
-        if '+' in topic or '#' in topic or len(topic) == 0 or len(topic) > 65535:
+        if b'+' in topic or b'#' in topic or len(topic) == 0 or len(topic) > 65535:
             return MQTT_ERR_INVAL
         else:
             return MQTT_ERR_SUCCESS
@@ -1897,66 +1905,41 @@ class Client(object):
             remaining_length = remaining_length // 128
             # If there are more digits to encode, set the top bit of this digit
             if remaining_length > 0:
-                byte = byte | 0x80
+                byte |= 0x80
 
             remaining_bytes.append(byte)
-            packet.extend(struct.pack("!B", byte))
+            packet.append(byte)
             if remaining_length == 0:
                 # FIXME - this doesn't deal with incorrectly large payloads
                 return packet
 
     def _pack_str16(self, packet, data):
-        if sys.version_info[0] < 3:
-            if isinstance(data, bytearray):
-                packet.extend(struct.pack("!H", len(data)))
-                packet.extend(data)
-            elif isinstance(data, str):
-                udata = data.encode('utf-8')
-                pack_format = "!H" + str(len(udata)) + "s"
-                packet.extend(struct.pack(pack_format, len(udata), udata))
-            elif isinstance(data, unicode):
-                udata = data.encode('utf-8')
-                pack_format = "!H" + str(len(udata)) + "s"
-                packet.extend(struct.pack(pack_format, len(udata), udata))
-            else:
-                raise TypeError
-        else:
-            if isinstance(data, bytearray) or isinstance(data, bytes):
-                packet.extend(struct.pack("!H", len(data)))
-                packet.extend(data)
-            elif isinstance(data, str):
-                udata = data.encode('utf-8')
-                pack_format = "!H" + str(len(udata)) + "s"
-                packet.extend(struct.pack(pack_format, len(udata), udata))
-            else:
-                raise TypeError
+        if isinstance(data, unicode):
+            data = data.encode('utf-8')
+        packet.extend(struct.pack("!H", len(data)))
+        packet.extend(data)
 
-    def _send_publish(self, mid, topic, payload=None, qos=0, retain=False, dup=False, info=None):
+    def _send_publish(self, mid, topic, payload=b'', qos=0, retain=False, dup=False, info=None):
+        # we assume that topic and payload are already properly encoded
+        # assert not isinstance(topic, unicode) and not isinstance(payload, unicode) and payload is not None
+
         if self._sock is None:
             return MQTT_ERR_NO_CONN
 
-        utopic = topic.encode('utf-8')
         command = PUBLISH | ((dup&0x1)<<3) | (qos<<1) | retain
         packet = bytearray()
-        packet.extend(struct.pack("!B", command))
-        if payload is None:
-            remaining_length = 2+len(utopic)
+        packet.append(command)
+
+        payloadlen = len(payload)
+        remaining_length = 2+len(topic) + payloadlen
+
+        if payloadlen == 0:
             self._easy_log(
                 MQTT_LOG_DEBUG,
                 "Sending PUBLISH (d%d, q%d, r%d, m%d), '%s' (NULL payload)",
                 dup, qos, retain, mid, topic
             )
         else:
-            if isinstance(payload, str):
-                upayload = payload.encode('utf-8')
-                payloadlen = len(upayload)
-            elif isinstance(payload, bytearray):
-                payloadlen = len(payload)
-            elif isinstance(payload, unicode):
-                upayload = payload.encode('utf-8')
-                payloadlen = len(upayload)
-
-            remaining_length = 2+len(utopic) + payloadlen
             self._easy_log(
                 MQTT_LOG_DEBUG,
                 "Sending PUBLISH (d%d, q%d, r%d, m%d), '%s', ... (%d bytes)",
@@ -1965,7 +1948,7 @@ class Client(object):
 
         if qos > 0:
             # For message id
-            remaining_length = remaining_length + 2
+            remaining_length += 2
 
         self._pack_remaining_length(packet, remaining_length)
         self._pack_str16(packet, topic)
@@ -1974,17 +1957,7 @@ class Client(object):
             # For message id
             packet.extend(struct.pack("!H", mid))
 
-        if payload is not None:
-            if isinstance(payload, str):
-                pack_format = str(payloadlen) + "s"
-                packet.extend(struct.pack(pack_format, upayload))
-            elif isinstance(payload, bytearray):
-                packet.extend(payload)
-            elif isinstance(payload, unicode):
-                pack_format = str(payloadlen) + "s"
-                packet.extend(struct.pack(pack_format, upayload))
-            else:
-                raise TypeError('payload must be a string, unicode or a bytearray.')
+        packet.extend(payload)
 
         return self._packet_queue(PUBLISH, packet, mid, qos, info)
 
@@ -1999,7 +1972,7 @@ class Client(object):
     def _send_command_with_mid(self, command, mid, dup):
         # For PUBACK, PUBCOMP, PUBREC, and PUBREL
         if dup:
-            command = command | 8
+            command |= 0x8
 
         remaining_length = 2
         packet = struct.pack('!BBH', command, remaining_length, mid)
@@ -2019,29 +1992,26 @@ class Client(object):
             protocol = PROTOCOL_NAMEv311
             proto_ver = 4
         protocol = protocol.encode('utf-8')
+
         remaining_length = 2+len(protocol) + 1+1+2 + 2+len(self._client_id)
         connect_flags = 0
         if clean_session:
-            connect_flags = connect_flags | 0x02
+            connect_flags |= 0x02
 
         if self._will:
-            if self._will_payload is not None:
-                remaining_length = remaining_length + 2+len(self._will_topic) + 2+len(self._will_payload)
-            else:
-                remaining_length = remaining_length + 2+len(self._will_topic) + 2
-
-            connect_flags = connect_flags | 0x04 | ((self._will_qos&0x03) << 3) | ((self._will_retain&0x01) << 5)
+            remaining_length += 2+len(self._will_topic) + 2+len(self._will_payload)
+            connect_flags |= 0x04 | ((self._will_qos&0x03) << 3) | ((self._will_retain&0x01) << 5)
 
         if self._username is not None:
-            remaining_length = remaining_length + 2+len(self._username)
-            connect_flags = connect_flags | 0x80
+            remaining_length += 2+len(self._username)
+            connect_flags |= 0x80
             if self._password is not None:
-                connect_flags = connect_flags | 0x40
-                remaining_length = remaining_length + 2+len(self._password)
+                connect_flags |= 0x40
+                remaining_length += 2+len(self._password)
 
         command = CONNECT
         packet = bytearray()
-        packet.extend(struct.pack("!B", command))
+        packet.append(command)
 
         self._pack_remaining_length(packet, remaining_length)
         packet.extend(struct.pack("!H"+str(len(protocol))+"sBBH", len(protocol), protocol, proto_ver, connect_flags, keepalive))
@@ -2050,10 +2020,7 @@ class Client(object):
 
         if self._will:
             self._pack_str16(packet, self._will_topic)
-            if self._will_payload is None or len(self._will_payload) == 0:
-                packet.extend(struct.pack("!H", 0))
-            else:
-                self._pack_str16(packet, self._will_payload)
+            self._pack_str16(packet, self._will_payload)
 
         if self._username is not None:
             self._pack_str16(packet, self._username)
@@ -2082,32 +2049,28 @@ class Client(object):
 
     def _send_subscribe(self, dup, topics):
         remaining_length = 2
-        for t in topics:
-            remaining_length = remaining_length + 2+len(t[0])+1
+        for t, _ in topics:
+            remaining_length += 2+len(t)+1
 
-        command = SUBSCRIBE | (dup<<3) | (1<<1)
+        command = SUBSCRIBE | (dup<<3) | 0x2
         packet = bytearray()
-        packet.extend(struct.pack("!B", command))
+        packet.append(command)
         self._pack_remaining_length(packet, remaining_length)
         local_mid = self._mid_generate()
         packet.extend(struct.pack("!H", local_mid))
-        for t in topics:
-            self._pack_str16(packet, t[0])
-            packet.extend(struct.pack("B", t[1]))
-
-        #topics_repr = ", ".join("'%s' q%s" % (topic.decode('utf8'), qos) for topic, qos in topics)
-        self._easy_log(MQTT_LOG_DEBUG, "Sending SUBSCRIBE (d%d, m%d) %s", dup, local_mid, topics)
-
+        for t, q in topics:
+            self._pack_str16(packet, t)
+            packet.append(q)
         return (self._packet_queue(command, packet, local_mid, 1), local_mid)
 
     def _send_unsubscribe(self, dup, topics):
         remaining_length = 2
         for t in topics:
-            remaining_length = remaining_length + 2+len(t)
+            remaining_length += 2+len(t)
 
-        command = UNSUBSCRIBE | (dup<<3) | (1<<1)
+        command = UNSUBSCRIBE | (dup<<3) | 0x2
         packet = bytearray()
-        packet.extend(struct.pack("!B", command))
+        packet.append(command)
         self._pack_remaining_length(packet, remaining_length)
         local_mid = self._mid_generate()
         packet.extend(struct.pack("!H", local_mid))
@@ -2196,7 +2159,7 @@ class Client(object):
         self._out_packet.append(mpkt)
         if self._current_out_packet_mutex.acquire(False):
             if self._current_out_packet is None and len(self._out_packet) > 0:
-                self._current_out_packet = self._out_packet.pop(0)
+                self._current_out_packet = self._out_packet.popleft()
             self._current_out_packet_mutex.release()
         self._out_packet_mutex.release()
 
@@ -2293,7 +2256,7 @@ class Client(object):
             if argcount == 3:
                 self.on_connect(self, self._userdata, result)
             else:
-                flags_dict = dict()
+                flags_dict = {}
                 flags_dict['session present'] = flags & 0x01
                 self.on_connect(self, self._userdata, flags_dict, result)
             self._in_callback = False
@@ -2317,7 +2280,7 @@ class Client(object):
                         return rc
                 elif m.qos == 1:
                     if m.state == mqtt_ms_publish:
-                        self._inflight_messages = self._inflight_messages + 1
+                        self._inflight_messages += 1
                         m.state = mqtt_ms_wait_for_puback
                         self._in_callback = True # Don't call loop_write after _send_publish()
                         rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
@@ -2327,7 +2290,7 @@ class Client(object):
                             return rc
                 elif m.qos == 2:
                     if m.state == mqtt_ms_publish:
-                        self._inflight_messages = self._inflight_messages + 1
+                        self._inflight_messages += 1
                         m.state = mqtt_ms_wait_for_pubrec
                         self._in_callback = True # Don't call loop_write after _send_publish()
                         rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
@@ -2336,7 +2299,7 @@ class Client(object):
                             self._out_message_mutex.release()
                             return rc
                     elif m.state == mqtt_ms_resend_pubrel:
-                        self._inflight_messages = self._inflight_messages + 1
+                        self._inflight_messages += 1
                         m.state = mqtt_ms_wait_for_pubcomp
                         self._in_callback = True # Don't call loop_write after _send_pubrel()
                         rc = self._send_pubrel(m.mid, m.dup)
@@ -2427,8 +2390,7 @@ class Client(object):
         if len(packet.payload) != 2:
             return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.payload)
-        mid = mid[0]
+        mid, = struct.unpack("!H", packet.payload)
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREL (Mid: %d)", mid)
 
         self._in_message_mutex.acquire()
@@ -2439,7 +2401,7 @@ class Client(object):
                 # prevents multiple callbacks for the same message.
                 self._handle_on_message(self._in_messages[i])
                 self._in_messages.pop(i)
-                self._inflight_messages = self._inflight_messages - 1
+                self._inflight_messages -= 1
                 if self._max_inflight_messages > 0:
                     self._out_message_mutex.acquire()
                     rc = self._update_inflight()
@@ -2459,7 +2421,7 @@ class Client(object):
         for m in self._out_messages:
             if self._inflight_messages < self._max_inflight_messages:
                 if m.qos > 0 and m.state == mqtt_ms_queued:
-                    self._inflight_messages = self._inflight_messages + 1
+                    self._inflight_messages += 1
                     if m.qos == 1:
                         m.state = mqtt_ms_wait_for_puback
                     elif m.qos == 2:
@@ -2476,8 +2438,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.payload)
-        mid = mid[0]
+        mid, = struct.unpack("!H", packet.payload)
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREC (Mid: %d)", mid)
 
         self._out_message_mutex.acquire()
@@ -2496,8 +2457,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.payload)
-        mid = mid[0]
+        mid, = struct.unpack("!H", packet.payload)
         self._easy_log(MQTT_LOG_DEBUG, "Received UNSUBACK (Mid: %d)", mid)
         self._callback_mutex.acquire()
         if self.on_unsubscribe:
@@ -2518,7 +2478,7 @@ class Client(object):
 
         msg = self._out_messages.pop(idx)
         if msg.qos > 0:
-            self._inflight_messages = self._inflight_messages - 1
+            self._inflight_messages -= 1
             if self._max_inflight_messages > 0:
                 rc = self._update_inflight()
                 if rc != MQTT_ERR_SUCCESS:
@@ -2531,8 +2491,7 @@ class Client(object):
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL
 
-        mid = struct.unpack("!H", packet.payload)
-        mid = mid[0]
+        mid, = struct.unpack("!H", packet.payload)
         self._easy_log(MQTT_LOG_DEBUG, "Received %s (Mid: %d)", cmd, mid)
 
         self._out_message_mutex.acquire()
@@ -2577,15 +2536,9 @@ class Client(object):
 
             host_match = host.split(".", 1)[1]
             cert_match = cert_host.split(".", 1)[1]
-            if host_match == cert_match:
-                return True
-            else:
-                return False
+            return host_match == cert_match
         else:
-            if host == cert_host:
-                return True
-            else:
-                return False
+            return host == cert_host
 
     def _tls_match_hostname(self, sock):
         try:
@@ -2601,7 +2554,7 @@ class Client(object):
             for (key, value) in san:
                 if key == 'DNS':
                     have_san_dns = True
-                    if self._host_matches_cert(self._host.lower(), value.lower()) == True:
+                    if self._host_matches_cert(self._host.lower(), value.lower()):
                         return
                 if key == 'IP Address':
                     have_san_dns = True
@@ -2615,7 +2568,7 @@ class Client(object):
         if subject:
             for ((key, value),) in subject:
                 if key == 'commonName':
-                    if self._host_matches_cert(self._host.lower(), value.lower()) == True:
+                    if self._host_matches_cert(self._host.lower(), value.lower()):
                         return
 
         raise ssl.SSLError('Certificate subject does not match remote hostname.')
@@ -2626,273 +2579,272 @@ class Mosquitto(Client):
     def __init__(self, client_id="", clean_session=True, userdata=None):
         super(Mosquitto, self).__init__(client_id, clean_session, userdata)
 
+class WebsocketWrapper:
 
-# class WebsocketWrapper:
-#
-#     OPCODE_CONTINUATION = 0x0
-#     OPCODE_TEXT = 0x1
-#     OPCODE_BINARY = 0x2
-#     OPCODE_CONNCLOSE = 0x8
-#     OPCODE_PING = 0x9
-#     OPCODE_PONG = 0xa
-#
-#     def __init__(self, socket, host, port, is_ssl):
-#
-#         self.connected = False
-#
-#         self._ssl = is_ssl
-#         self._host = host
-#         self._port = port
-#         self._socket = socket
-#
-#         self._sendbuffer = bytearray()
-#         self._readbuffer = bytearray()
-#
-#         self._requested_size = 0
-#         self._payload_head = 0
-#         self._readbuffer_head = 0
-#
-#         self._do_handshake()
-#
-#     def __del__(self):
-#
-#         self._sendbuffer = None
-#         self._readbuffer = None
-#
-#     def _do_handshake(self):
-#
-#         sec_websocket_key = uuid.uuid4().bytes
-#         sec_websocket_key = base64.b64encode(sec_websocket_key)
-#
-#         header = b"GET /mqtt HTTP/1.1\r\n" +\
-#                  b"Upgrade: websocket\r\n" +\
-#                  b"Connection: Upgrade\r\n" +\
-#                  b"Host: " + str(self._host).encode('utf-8') + b":" + str(self._port).encode('utf-8') + b"\r\n" +\
-#                  b"Origin: http://" + str(self._host).encode('utf-8') + b":" + str(self._port).encode('utf-8') + b"\r\n" +\
-#                  b"Sec-WebSocket-Key: " + sec_websocket_key + b"\r\n" +\
-#                  b"Sec-WebSocket-Version: 13\r\n" +\
-#                  b"Sec-WebSocket-Protocol: mqtt\r\n\r\n"
-#
-#         self._socket.send(header)
-#
-#         has_secret = False
-#         has_upgrade = False
-#
-#         while True:
-#             # read HTTP response header as lines
-#             byte = self._socket.recv(1)
-#
-#             self._readbuffer.extend(byte)
-#             # line end
-#             if byte == b"\n":
-#                 if len(self._readbuffer) > 2:
-#                     # check upgrade
-#                     if b"connection" in str(self._readbuffer).lower().encode('utf-8'):
-#                         if b"upgrade" not in str(self._readbuffer).lower().encode('utf-8'):
-#                             raise ValueError("WebSocket handshake error, connection not upgraded")
-#                         else:
-#                             has_upgrade = True
-#
-#                     # check key hash
-#                     if b"sec-websocket-accept" in str(self._readbuffer).lower().encode('utf-8'):
-#                         GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#
-#                         server_hash = self._readbuffer.decode('utf-8').split(": ", 1)[1]
-#                         server_hash = server_hash.strip().encode('utf-8')
-#
-#                         client_hash = sec_websocket_key.decode('utf-8') + GUID
-#                         client_hash = hashlib.sha1(client_hash.encode('utf-8'))
-#                         client_hash = base64.b64encode(client_hash.digest())
-#
-#                         if server_hash != client_hash:
-#                             raise ValueError("WebSocket handshake error, invalid secret key")
-#                         else:
-#                             has_secret = True
-#                 else:
-#                     # ending linebreak
-#                     break
-#
-#                 # reset linebuffer
-#                 self._readbuffer = bytearray()
-#
-#             # connection reset
-#             elif not byte:
-#                 raise ValueError("WebSocket handshake error")
-#
-#         if not has_upgrade or not has_secret:
-#             raise ValueError("WebSocket handshake error")
-#
-#         self._readbuffer = bytearray()
-#         self.connected = True
-#
-#     def _create_frame(self, opcode, data, do_masking=1):
-#
-#         header = bytearray()
-#         length = len(data)
-#         mask_key = bytearray([random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)])
-#         mask_flag = do_masking
-#
-#         # 1 << 7 is the final flag, we don't send continuated data
-#         header.append(1 << 7 | opcode)
-#
-#         if length < 126:
-#             header.append(mask_flag << 7 | length)
-#
-#         elif length < 32768:
-#             header.append(mask_flag << 7 | 126)
-#             header += struct.pack("!H", length)
-#
-#         elif length < 0x8000000000000001:
-#             header.append(mask_flag << 7 | 127)
-#             header += struct.pack("!Q", length)
-#
-#         else:
-#             raise ValueError("Maximum payload size is 2^63")
-#
-#         if mask_flag == 1:
-#             for index in range(length):
-#                 data[index] ^= mask_key[index % 4]
-#             data = mask_key + data
-#
-#         return header + data
-#
-#     def _buffered_read(self, length):
-#
-#         # try to recv and strore needed bytes
-#         if self._readbuffer_head + length > len(self._readbuffer):
-#
-#             data = self._socket.recv(self._readbuffer_head + length - len(self._readbuffer))
-#
-#             if not data:
-#                 raise socket.error(errno.ECONNABORTED, 0)
-#             else:
-#                 self._readbuffer.extend(data)
-#
-#         self._readbuffer_head += length
-#         return self._readbuffer[self._readbuffer_head-length:self._readbuffer_head]
-#
-#     def _recv_impl(self, length):
-#
-#         # try to decode websocket payload part from data
-#         try:
-#
-#             self._readbuffer_head = 0
-#
-#             result = None
-#
-#             chunk_startindex = self._payload_head
-#             chunk_endindex = self._payload_head + length
-#
-#             header1 = self._buffered_read(1)
-#             header2 = self._buffered_read(1)
-#
-#             opcode = (header1[0] & 0x0f)
-#             maskbit = (header2[0] & 0x80) == 0x80
-#             lengthbits = (header2[0] & 0x7f)
-#             payload_length = lengthbits
-#             mask_key = None
-#
-#             # read length
-#             if lengthbits == 0x7e:
-#
-#                 value = self._buffered_read(2)
-#                 payload_length = struct.unpack("!H", value)[0]
-#
-#             elif lengthbits == 0x7f:
-#
-#                 value = self._buffered_read(8)
-#                 payload_length = struct.unpack("!Q", value)[0]
-#
-#             # read mask
-#             if maskbit:
-#
-#                 mask_key = self._buffered_read(4)
-#
-#             # if frame payload is shorter than the requested data, read only the possible part
-#             readindex = chunk_endindex
-#             if payload_length < readindex:
-#                 readindex = payload_length
-#
-#             if readindex > 0:
-#
-#                 # get payload chunk
-#                 payload = self._buffered_read(readindex)
-#
-#                 # unmask only the needed part
-#                 if maskbit:
-#                     for index in range(chunk_startindex, readindex):
-#                         payload[index] ^= mask_key[index % 4]
-#
-#                 result = payload[chunk_startindex:readindex]
-#                 self._payload_head = readindex
-#
-#             # check if full frame arrived and reset readbuffer and payloadhead if needed
-#             if readindex == payload_length:
-#                 self._readbuffer = bytearray()
-#                 self._payload_head = 0
-#
-#                 # respond to non-binary opcodes, their arrival is not guaranteed beacause of non-blocking sockets
-#                 if opcode == WebsocketWrapper.OPCODE_CONNCLOSE:
-#                     frame = self._create_frame(WebsocketWrapper.OPCODE_CONNCLOSE, payload, 0)
-#                     self._socket.send(frame)
-#
-#                 if opcode == WebsocketWrapper.OPCODE_PING:
-#                     frame = self._create_frame(WebsocketWrapper.OPCODE_PONG, payload, 0)
-#                     self._socket.send(frame)
-#
-#             if opcode == WebsocketWrapper.OPCODE_BINARY:
-#                 return result
-#             else:
-#                 raise socket.error(errno.EAGAIN, 0)
-#
-#         except socket.error as err:
-#
-#             if err.errno == errno.ECONNABORTED:
-#                 self.connected = False
-#                 return b''
-#             else:
-#                 # no more data
-#                 raise
-#
-#     def _send_impl(self, data):
-#
-#         # if previous frame was sent successfully
-#         if len(self._sendbuffer) == 0:
-#
-#             # create websocket frame
-#             frame = self._create_frame(WebsocketWrapper.OPCODE_BINARY, bytearray(data))
-#             self._sendbuffer.extend(frame)
-#             self._requested_size = len(data)
-#
-#         # try to write out as much as possible
-#         length = self._socket.send(self._sendbuffer)
-#
-#         self._sendbuffer = self._sendbuffer[length:]
-#
-#         if len(self._sendbuffer) == 0:
-#             # buffer sent out completely, return with payload's size
-#             return self._requested_size
-#         else:
-#             # couldn't send whole data, request the same data again with 0 as sent length
-#             return 0
-#
-#     def recv(self, length):
-#         return self._recv_impl(length)
-#
-#     def read(self, length):
-#         return self._recv_impl(length)
-#
-#     def send(self, data):
-#         return self._send_impl(data)
-#
-#     def write(self, data):
-#         return self._send_impl(data)
-#
-#     def close(self):
-#         self._socket.close()
-#
-#     def fileno(self):
-#         return self._socket.fileno()
-#
-#     def setblocking(self,flag):
-#         self._socket.setblocking(flag)
+    OPCODE_CONTINUATION = 0x0
+    OPCODE_TEXT = 0x1
+    OPCODE_BINARY = 0x2
+    OPCODE_CONNCLOSE = 0x8
+    OPCODE_PING = 0x9
+    OPCODE_PONG = 0xa
+
+    def __init__(self, socket, host, port, is_ssl):
+
+        self.connected = False
+
+        self._ssl = is_ssl
+        self._host = host
+        self._port = port
+        self._socket = socket
+
+        self._sendbuffer = bytearray()
+        self._readbuffer = bytearray()
+
+        self._requested_size = 0
+        self._payload_head = 0
+        self._readbuffer_head = 0
+
+        self._do_handshake()
+
+    def __del__(self):
+
+        self._sendbuffer = None
+        self._readbuffer = None
+
+    def _do_handshake(self):
+
+        sec_websocket_key = uuid.uuid4().bytes
+        sec_websocket_key = base64.b64encode(sec_websocket_key)
+
+        header = b"GET /mqtt HTTP/1.1\r\n" +\
+                 b"Upgrade: websocket\r\n" +\
+                 b"Connection: Upgrade\r\n" +\
+                 b"Host: " + str(self._host).encode('utf-8') + b":" + str(self._port).encode('utf-8') + b"\r\n" +\
+                 b"Origin: http://" + str(self._host).encode('utf-8') + b":" + str(self._port).encode('utf-8') + b"\r\n" +\
+                 b"Sec-WebSocket-Key: " + sec_websocket_key + b"\r\n" +\
+                 b"Sec-WebSocket-Version: 13\r\n" +\
+                 b"Sec-WebSocket-Protocol: mqtt\r\n\r\n"
+
+        self._socket.send(header)
+
+        has_secret = False
+        has_upgrade = False
+
+        while True:
+            # read HTTP response header as lines
+            byte = self._socket.recv(1)
+
+            self._readbuffer.extend(byte)
+            # line end
+            if byte == b"\n":
+                if len(self._readbuffer) > 2:
+                    # check upgrade
+                    if b"connection" in str(self._readbuffer).lower().encode('utf-8'):
+                        if b"upgrade" not in str(self._readbuffer).lower().encode('utf-8'):
+                            raise ValueError("WebSocket handshake error, connection not upgraded")
+                        else:
+                            has_upgrade = True
+
+                    # check key hash
+                    if b"sec-websocket-accept" in str(self._readbuffer).lower().encode('utf-8'):
+                        GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+                        server_hash = self._readbuffer.decode('utf-8').split(": ", 1)[1]
+                        server_hash = server_hash.strip().encode('utf-8')
+
+                        client_hash = sec_websocket_key.decode('utf-8') + GUID
+                        client_hash = hashlib.sha1(client_hash.encode('utf-8'))
+                        client_hash = base64.b64encode(client_hash.digest())
+
+                        if server_hash != client_hash:
+                            raise ValueError("WebSocket handshake error, invalid secret key")
+                        else:
+                            has_secret = True
+                else:
+                    # ending linebreak
+                    break
+
+                # reset linebuffer
+                self._readbuffer = bytearray()
+
+            # connection reset
+            elif not byte:
+                raise ValueError("WebSocket handshake error")
+
+        if not has_upgrade or not has_secret:
+            raise ValueError("WebSocket handshake error")
+
+        self._readbuffer = bytearray()
+        self.connected = True
+
+    def _create_frame(self, opcode, data, do_masking=1):
+
+        header = bytearray()
+        length = len(data)
+        mask_key = bytearray([random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)])
+        mask_flag = do_masking
+
+        # 1 << 7 is the final flag, we don't send continuated data
+        header.append(1 << 7 | opcode)
+
+        if length < 126:
+            header.append(mask_flag << 7 | length)
+
+        elif length < 32768:
+            header.append(mask_flag << 7 | 126)
+            header += struct.pack("!H", length)
+
+        elif length < 0x8000000000000001:
+            header.append(mask_flag << 7 | 127)
+            header += struct.pack("!Q", length)
+
+        else:
+            raise ValueError("Maximum payload size is 2^63")
+
+        if mask_flag == 1:
+            for index in range(length):
+                data[index] ^= mask_key[index % 4]
+            data = mask_key + data
+
+        return header + data
+
+    def _buffered_read(self, length):
+
+        # try to recv and strore needed bytes
+        if self._readbuffer_head + length > len(self._readbuffer):
+
+            data = self._socket.recv(self._readbuffer_head + length - len(self._readbuffer))
+
+            if not data:
+                raise socket.error(errno.ECONNABORTED, 0)
+            else:
+                self._readbuffer.extend(data)
+
+        self._readbuffer_head += length
+        return self._readbuffer[self._readbuffer_head-length:self._readbuffer_head]
+
+    def _recv_impl(self, length):
+
+        # try to decode websocket payload part from data
+        try:
+
+            self._readbuffer_head = 0
+
+            result = None
+
+            chunk_startindex = self._payload_head
+            chunk_endindex = self._payload_head + length
+
+            header1 = self._buffered_read(1)
+            header2 = self._buffered_read(1)
+
+            opcode = (header1[0] & 0x0f)
+            maskbit = (header2[0] & 0x80) == 0x80
+            lengthbits = (header2[0] & 0x7f)
+            payload_length = lengthbits
+            mask_key = None
+
+            # read length
+            if lengthbits == 0x7e:
+
+                value = self._buffered_read(2)
+                payload_length, = struct.unpack("!H", value)
+
+            elif lengthbits == 0x7f:
+
+                value = self._buffered_read(8)
+                payload_length, = struct.unpack("!Q", value)
+
+            # read mask
+            if maskbit:
+
+                mask_key = self._buffered_read(4)
+
+            # if frame payload is shorter than the requested data, read only the possible part
+            readindex = chunk_endindex
+            if payload_length < readindex:
+                readindex = payload_length
+
+            if readindex > 0:
+
+                # get payload chunk
+                payload = self._buffered_read(readindex)
+
+                # unmask only the needed part
+                if maskbit:
+                    for index in range(chunk_startindex, readindex):
+                        payload[index] ^= mask_key[index % 4]
+
+                result = payload[chunk_startindex:readindex]
+                self._payload_head = readindex
+
+            # check if full frame arrived and reset readbuffer and payloadhead if needed
+            if readindex == payload_length:
+                self._readbuffer = bytearray()
+                self._payload_head = 0
+
+                # respond to non-binary opcodes, their arrival is not guaranteed beacause of non-blocking sockets
+                if opcode == WebsocketWrapper.OPCODE_CONNCLOSE:
+                    frame = self._create_frame(WebsocketWrapper.OPCODE_CONNCLOSE, payload, 0)
+                    self._socket.send(frame)
+
+                if opcode == WebsocketWrapper.OPCODE_PING:
+                    frame = self._create_frame(WebsocketWrapper.OPCODE_PONG, payload, 0)
+                    self._socket.send(frame)
+
+            if opcode == WebsocketWrapper.OPCODE_BINARY:
+                return result
+            else:
+                raise socket.error(errno.EAGAIN, 0)
+
+        except socket.error as err:
+
+            if err.errno == errno.ECONNABORTED:
+                self.connected = False
+                return b''
+            else:
+                # no more data
+                raise
+
+    def _send_impl(self, data):
+
+        # if previous frame was sent successfully
+        if len(self._sendbuffer) == 0:
+
+            # create websocket frame
+            frame = self._create_frame(WebsocketWrapper.OPCODE_BINARY, bytearray(data))
+            self._sendbuffer.extend(frame)
+            self._requested_size = len(data)
+
+        # try to write out as much as possible
+        length = self._socket.send(self._sendbuffer)
+
+        self._sendbuffer = self._sendbuffer[length:]
+
+        if len(self._sendbuffer) == 0:
+            # buffer sent out completely, return with payload's size
+            return self._requested_size
+        else:
+            # couldn't send whole data, request the same data again with 0 as sent length
+            return 0
+
+    def recv(self, length):
+        return self._recv_impl(length)
+
+    def read(self, length):
+        return self._recv_impl(length)
+
+    def send(self, data):
+        return self._send_impl(data)
+
+    def write(self, data):
+        return self._send_impl(data)
+
+    def close(self):
+        self._socket.close()
+
+    def fileno(self):
+        return self._socket.fileno()
+
+    def setblocking(self,flag):
+        self._socket.setblocking(flag)

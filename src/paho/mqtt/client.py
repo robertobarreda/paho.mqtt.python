@@ -17,7 +17,6 @@ This is an MQTT v3.1 client module. MQTT is a lightweight pub/sub messaging
 protocol that is easy to implement and suitable for low powered devices.
 """
 import contextlib
-import collections
 import errno
 import platform
 import random
@@ -337,17 +336,15 @@ class MQTTMessage(object):
 class MQTTPacket(object):
     """ This is a class that describes an incoming or outgoing packet
     """
-    __slots__ = ('command', 'have_remaining', 'remaining_count',
-                 'remaining_mult', 'remaining_length', 'to_process', 'payload')
+    __slots__ = ('command', 'remaining_count', 'remaining_length', 'payload', 'mid', 'qos')
 
     def __init__(self):
         self.command = 0
-        self.have_remaining = 0
         self.remaining_count = []
-        self.remaining_mult = 1
         self.remaining_length = 0
-        self.to_process = 0
         self.payload = b""
+        self.mid = 0
+        self.qos = 0
 
 
 class MQTTTransportException(Exception):
@@ -1720,6 +1717,7 @@ class Client(object):
         # fail due to longer length, so save current data and current position.
         # After all data is read, send to _mqtt_handle_packet() to deal with.
         # Finally, free the memory and reset everything to starting conditions.
+        remaining_mult = 1
         packet = MQTTPacket()
 
         with (yield self._read_lock.acquire()):
@@ -1728,7 +1726,7 @@ class Client(object):
                 if len(command) == 0:
                     raise gen.Return(1)
                 command, = struct.unpack("!B", command)
-                packet.command = command[0]
+                packet.command = command
 
                 # Read remaining
                 # Algorithm for decoding taken from pseudo code at
@@ -1742,18 +1740,17 @@ class Client(object):
                     if len(packet.remaining_count) > 4:
                         raise gen.Return(MQTT_ERR_PROTOCOL)
 
-                    packet.remaining_length += (byte & 127) * packet.remaining_mult
-                    packet.remaining_mult *= 128
+                    packet.remaining_length += (byte & 127) * remaining_mult
+                    remaining_mult *= 128
 
                     if (byte & 128) == 0:
                         break
 
-                packet.have_remaining = 1
-                packet.to_process = packet.remaining_length
+                to_process = packet.remaining_length
 
-                while packet.to_process > 0:
-                    data = yield self._read_bytes(packet.to_process)
-                    packet.to_process -= len(data)
+                while to_process > 0:
+                    data = yield self._read_bytes(to_process)
+                    to_process -= len(data)
                     packet.payload += data
 
         # All data for this packet is read.
@@ -2146,14 +2143,11 @@ class Client(object):
         self._messages_reconnect_reset_in()
 
     def _packet_queue(self, command, packet, mid, qos, info=None):
-        mpkt = MQTTMessage()
+        mpkt = MQTTPacket()
         mpkt.command = command
+        mpkt.payload = packet
         mpkt.mid = mid
         mpkt.qos = qos
-        mpkt.pos = 0
-        mpkt.to_process = len(packet)
-        mpkt.packet = packet
-        mpkt.info = info
 
         self._out_packet_mutex.acquire()
         self._out_packet.append(mpkt)
@@ -2261,6 +2255,7 @@ class Client(object):
                 self.on_connect(self, self._userdata, flags_dict, result)
             self._in_callback = False
         self._callback_mutex.release()
+
         if result == 0:
             rc = 0
             self._out_message_mutex.acquire()

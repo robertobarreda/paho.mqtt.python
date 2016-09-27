@@ -2183,15 +2183,14 @@ class Client(object):
         self._messages_reconnect_reset_in()
 
     def _packet_queue(self, command, packet, mid, qos, info=None):
-        mpkt = dict(
-            command = command,
-            mid = mid,
-            qos = qos,
-            pos = 0,
-            to_process = len(packet),
-            packet = packet,
-            info = info
-        )
+        mpkt = MQTTMessage()
+        mpkt.command = command
+        mpkt.mid = mid
+        mpkt.qos = qos
+        mpkt.pos = 0
+        mpkt.to_process = len(packet)
+        mpkt.packet = packet
+        mpkt.info = info
 
         self._out_packet_mutex.acquire()
         self._out_packet.append(mpkt)

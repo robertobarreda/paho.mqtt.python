@@ -557,6 +557,7 @@ class Client(object):
         self._out_message_mutex = threading.Lock()
         self._in_message_mutex = threading.Lock()
         self._connected = locks.Event()
+        self._read_lock = locks.Lock()
         self._thread = None
         self._thread_terminate = False
         self._tls_certfile = None
@@ -844,16 +845,13 @@ class Client(object):
         future = self._client.connect(self._host, self._port, ssl_options=_ssl_options)
         self.io_loop.add_future(future, self._on_connection_done)
 
-        return self._send_connect(self._keepalive, self._clean_session)
-
     def _on_connection_done(self, future):
-        try:
-            self._sock = future.result()
-            self._sock.set_nodelay(True)
-            self.connected.set()
-        except Exception as e:
-            print e
+        self._sock = future.result()
+        self._sock.set_nodelay(True)
+        self.connected.set()
+        self._send_connect(self._keepalive, self._clean_session)
 
+    @gen.coroutine
     def loop(self, timeout=1.0, max_packets=1):
         """Process network events.
 
@@ -878,16 +876,17 @@ class Client(object):
             raise ValueError('Invalid timeout.')
 
         if self._sock:
-            rc = self.loop_read(max_packets)
+            rc = yield self.loop_read(max_packets)
             if rc or self._sock is None:
-                return rc
+                raise gen.Return(rc)
 
         if self._sock:
-            rc = self.loop_write(max_packets)
+            rc = yield self.loop_write(max_packets)
             if rc or self._sock is None:
-                return rc
+                raise gen.Return(rc)
 
-        return self.loop_misc()
+        rc = self.loop_misc()
+        raise gen.Return(rc)
 
     def publish(self, topic, payload=None, qos=0, retain=False):
         """Publish a message on a topic.
@@ -1308,6 +1307,7 @@ class Client(object):
         """Return the socket or ssl object for this client."""
         return self._sock
 
+    @gen.coroutine
     def loop_forever(self, timeout=1.0, max_packets=1, retry_first_connection=False):
         """This function call loop() for you in an infinite blocking loop. It
         is useful for the case where you only want to run the MQTT client loop
@@ -1338,14 +1338,14 @@ class Client(object):
                     if not retry_first_connection:
                         raise
                     self._easy_log(MQTT_LOG_DEBUG, "Connection failed, retrying")
-                    time.sleep(1)
+                    yield gen.sleep(1)
             else:
                 break
 
         while run:
             rc = MQTT_ERR_SUCCESS
             while rc == MQTT_ERR_SUCCESS:
-                rc = self.loop(timeout, max_packets)
+                rc = yield self.loop(timeout, max_packets)
                 # We don't need to worry about locking here, because we've
                 # either called loop_forever() when in single threaded mode, or
                 # in multi threaded mode when loop_stop() has been called and
@@ -1364,20 +1364,20 @@ class Client(object):
                 self._state_mutex.release()
             else:
                 self._state_mutex.release()
-                time.sleep(1)
+                yield gen.sleep(1)
 
                 self._state_mutex.acquire()
                 if self._state == mqtt_cs_disconnecting or run is False or self._thread_terminate is True:
                     run = False
                     self._state_mutex.release()
-                else:
-                    self._state_mutex.release()
-                    try:
-                        self.reconnect()
-                    except socket.error as err:
-                        pass
+                # else:
+                #     self._state_mutex.release()
+                #     try:
+                #         self.reconnect()
+                #     except socket.error as err:
+                #         pass
 
-        return rc
+        raise gen.Return(rc)
 
     def loop_start(self):
         """This is part of the threaded client interface. Call this once to
@@ -1408,7 +1408,6 @@ class Client(object):
             self._thread = None
 
     def start(self):
-        self.io_loop.spawn_callback(self.loop_forever)
         self.io_loop.start()
 
     def stop(self):
@@ -2090,8 +2089,8 @@ class Client(object):
 
         if not self._in_callback and self._thread is None:
             return self.loop_write()
-        else:
-            return MQTT_ERR_SUCCESS
+
+        return MQTT_ERR_SUCCESS
 
     def _packet_handle(self, packet):
         cmd = packet.command & 0xF0
@@ -2181,52 +2180,52 @@ class Client(object):
 
         if result == 0:
             rc = 0
-            self._out_message_mutex.acquire()
-            for m in self._out_messages:
-                m.timestamp = time_func()
-                if m.state == mqtt_ms_queued:
-                    self.loop_write()  # Process outgoing messages that have just been queued up
-                    self._out_message_mutex.release()
-                    return MQTT_ERR_SUCCESS
+            # self._out_message_mutex.acquire()
+            # for m in self._out_messages:
+            #     m.timestamp = time_func()
+            #     if m.state == mqtt_ms_queued:
+            #         self.loop_write()  # Process outgoing messages that have just been queued up
+            #         self._out_message_mutex.release()
+            #         return MQTT_ERR_SUCCESS
 
-                if m.qos == 0:
-                    self._in_callback = True # Don't call loop_write after _send_publish()
-                    rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
-                    self._in_callback = False
-                    if rc != 0:
-                        self._out_message_mutex.release()
-                        return rc
-                elif m.qos == 1:
-                    if m.state == mqtt_ms_publish:
-                        self._inflight_messages += 1
-                        m.state = mqtt_ms_wait_for_puback
-                        self._in_callback = True # Don't call loop_write after _send_publish()
-                        rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
-                        self._in_callback = False
-                        if rc != 0:
-                            self._out_message_mutex.release()
-                            return rc
-                elif m.qos == 2:
-                    if m.state == mqtt_ms_publish:
-                        self._inflight_messages += 1
-                        m.state = mqtt_ms_wait_for_pubrec
-                        self._in_callback = True # Don't call loop_write after _send_publish()
-                        rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
-                        self._in_callback = False
-                        if rc != 0:
-                            self._out_message_mutex.release()
-                            return rc
-                    elif m.state == mqtt_ms_resend_pubrel:
-                        self._inflight_messages += 1
-                        m.state = mqtt_ms_wait_for_pubcomp
-                        self._in_callback = True # Don't call loop_write after _send_pubrel()
-                        rc = self._send_pubrel(m.mid, m.dup)
-                        self._in_callback = False
-                        if rc != 0:
-                            self._out_message_mutex.release()
-                            return rc
-                self.loop_write() # Process outgoing messages that have just been queued up
-            self._out_message_mutex.release()
+            #     if m.qos == 0:
+            #         self._in_callback = True # Don't call loop_write after _send_publish()
+            #         rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
+            #         self._in_callback = False
+            #         if rc != 0:
+            #             self._out_message_mutex.release()
+            #             return rc
+            #     elif m.qos == 1:
+            #         if m.state == mqtt_ms_publish:
+            #             self._inflight_messages += 1
+            #             m.state = mqtt_ms_wait_for_puback
+            #             self._in_callback = True # Don't call loop_write after _send_publish()
+            #             rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
+            #             self._in_callback = False
+            #             if rc != 0:
+            #                 self._out_message_mutex.release()
+            #                 return rc
+            #     elif m.qos == 2:
+            #         if m.state == mqtt_ms_publish:
+            #             self._inflight_messages += 1
+            #             m.state = mqtt_ms_wait_for_pubrec
+            #             self._in_callback = True # Don't call loop_write after _send_publish()
+            #             rc = self._send_publish(m.mid, m.topic, m.payload, m.qos, m.retain, m.dup)
+            #             self._in_callback = False
+            #             if rc != 0:
+            #                 self._out_message_mutex.release()
+            #                 return rc
+            #         elif m.state == mqtt_ms_resend_pubrel:
+            #             self._inflight_messages += 1
+            #             m.state = mqtt_ms_wait_for_pubcomp
+            #             self._in_callback = True # Don't call loop_write after _send_pubrel()
+            #             rc = self._send_pubrel(m.mid, m.dup)
+            #             self._in_callback = False
+            #             if rc != 0:
+            #                 self._out_message_mutex.release()
+            #                 return rc
+            #     self.loop_write() # Process outgoing messages that have just been queued up
+            # self._out_message_mutex.release()
             return rc
         elif result > 0 and result < 6:
             return MQTT_ERR_CONN_REFUSED
@@ -2445,7 +2444,7 @@ class Client(object):
         self._callback_mutex.release()
 
     def _thread_main(self):
-        self.loop_forever(retry_first_connection=True)
+        self.io_loop.spawn_callback(self.loop_forever, retry_first_connection=True)
 
     def _host_matches_cert(self, host, cert_host):
         if cert_host[0:2] == "*.":

@@ -558,6 +558,7 @@ class Client(object):
         self._in_message_mutex = threading.Lock()
         self._connected = locks.Event()
         self._read_lock = locks.Lock()
+        self._periodic_callback = None
         self._thread = None
         self._thread_terminate = False
         self._tls_certfile = None
@@ -841,6 +842,7 @@ class Client(object):
         #     else:
         #         sock = WebsocketWrapper(sock, self._host, self._port, False)
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         self._client = TCPClient(io_loop=self.io_loop)
         future = self._client.connect(self._host, self._port, ssl_options=_ssl_options)
         self.io_loop.add_future(future, self._on_connection_done)
@@ -875,18 +877,22 @@ class Client(object):
         if timeout < 0.0:
             raise ValueError('Invalid timeout.')
 
-        if self._sock:
-            rc = yield self.loop_read(max_packets)
-            if rc or self._sock is None:
-                raise gen.Return(rc)
+        self.io_loop.spawn_callback(self.loop_write, max_packets)
+        self.io_loop.spawn_callback(self.loop_read, max_packets)
+        self.attach_periodic_callback(self.loop_misc, 1000)
 
-        if self._sock:
-            rc = yield self.loop_write(max_packets)
-            if rc or self._sock is None:
-                raise gen.Return(rc)
+        # if self._sock:
+        #     rc = yield self.loop_read(max_packets)
+        #     if rc or self._sock is None:
+        #         raise gen.Return(rc)
 
-        rc = self.loop_misc()
-        raise gen.Return(rc)
+        # if self._sock:
+        #     rc = yield self.loop_write(max_packets)
+        #     if rc or self._sock is None:
+        #         raise gen.Return(rc)
+
+        # rc = self.loop_misc()
+        # raise gen.Return(rc)
 
     def publish(self, topic, payload=None, qos=0, retain=False):
         """Publish a message on a topic.
@@ -1139,6 +1145,9 @@ class Client(object):
         on.
 
         Do not use if you are using the threaded interface loop_start()."""
+        yield self.connected.wait()
+
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
@@ -1148,6 +1157,7 @@ class Client(object):
 
         for _ in range(0, max_packets):
             rc = yield self._packet_read()
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1166,6 +1176,9 @@ class Client(object):
         Use want_write() to determine if there is data waiting to be written.
 
         Do not use if you are using the threaded interface loop_start()."""
+        yield self.connected.wait()
+
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
@@ -1177,6 +1190,7 @@ class Client(object):
             packet = yield self._out_packet.get()
             rc = yield self._packet_write(packet)
             self._out_packet.task_done()
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1190,11 +1204,15 @@ class Client(object):
         """
         return self._out_packet.qsize() > 0
 
+    @gen.coroutine
     def loop_misc(self):
         """Process miscellaneous network events. Use in place of calling loop() if you
         wish to call select() or equivalent on.
 
         Do not use if you are using the threaded interface loop_start()."""
+        yield self._connected.wait()
+
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             return MQTT_ERR_NO_CONN
 
@@ -1327,6 +1345,7 @@ class Client(object):
 
         run = True
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         while run:
             if self._thread_terminate is True:
                 break
@@ -1412,6 +1431,19 @@ class Client(object):
 
     def stop(self):
         self.io_loop.stop()
+
+    def attach_periodic_callback(self, callback, callback_time):
+        if self._periodic_callback is not None:
+            self.dettach_periodic_callback()
+
+        self._periodic_callback = ioloop.PeriodicCallback(
+            callback, callback_time, self.io_loop)
+        self._periodic_callback.start()
+
+    def dettach_periodic_callback(self):
+        if self._periodic_callback is not None:
+            self._periodic_callback.stop()
+        self._periodic_callback = None
 
     @property
     def on_log(self):
@@ -1671,9 +1703,12 @@ class Client(object):
         remaining_mult = 1
         packet = MQTTPacket()
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         with (yield self._read_lock.acquire()):
             with io_exception_context(self):
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 command = yield self._read_bytes(1)
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 if len(command) == 0:
                     raise gen.Return(1)
                 command, = struct.unpack("!B", command)
@@ -1716,8 +1751,10 @@ class Client(object):
     @gen.coroutine
     def _packet_write(self, packet):
         with io_exception_context(self):
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             yield self._write(packet.payload)
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
             self._callback_mutex.acquire()
             if self.on_publish:
@@ -2138,6 +2175,7 @@ class Client(object):
         return MQTT_ERR_SUCCESS
 
     def _handle_connack(self, packet):
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._strict_protocol:
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL

@@ -1214,7 +1214,7 @@ class Client(object):
 
         import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
-            return MQTT_ERR_NO_CONN
+            raise gen.Return(MQTT_ERR_NO_CONN)
 
         now = time_func()
         self._check_keepalive()
@@ -1238,9 +1238,9 @@ class Client(object):
                 self.on_disconnect(self, self._userdata, rc)
                 self._in_callback = False
             self._callback_mutex.release()
-            return MQTT_ERR_CONN_LOST
+            raise gen.Return(MQTT_ERR_CONN_LOST)
 
-        return MQTT_ERR_SUCCESS
+        raise gen.Return(MQTT_ERR_SUCCESS)
 
     def max_inflight_messages_set(self, inflight):
         """Set the maximum number of messages with QoS>0 that can be part way
@@ -1683,7 +1683,7 @@ class Client(object):
         return self._sock.read_bytes(num_bytes)
 
     def _write(self, msg):
-        return self._sock.write(msg)
+        return self._sock.write(str(msg))
 
     @gen.coroutine
     def _packet_read(self):

@@ -842,7 +842,6 @@ class Client(object):
         #     else:
         #         sock = WebsocketWrapper(sock, self._host, self._port, False)
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         self._client = TCPClient(io_loop=self.io_loop)
         future = self._client.connect(self._host, self._port, ssl_options=_ssl_options)
         self.io_loop.add_future(future, self._on_connection_done)
@@ -1147,7 +1146,6 @@ class Client(object):
         Do not use if you are using the threaded interface loop_start()."""
         yield self.connected.wait()
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
@@ -1157,7 +1155,6 @@ class Client(object):
 
         for _ in range(0, max_packets):
             rc = yield self._packet_read()
-            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1178,7 +1175,6 @@ class Client(object):
         Do not use if you are using the threaded interface loop_start()."""
         yield self.connected.wait()
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
@@ -1190,7 +1186,6 @@ class Client(object):
             packet = yield self._out_packet.get()
             rc = yield self._packet_write(packet)
             self._out_packet.task_done()
-            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             if rc > 0:
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
@@ -1212,7 +1207,6 @@ class Client(object):
         Do not use if you are using the threaded interface loop_start()."""
         yield self._connected.wait()
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._sock is None:
             raise gen.Return(MQTT_ERR_NO_CONN)
 
@@ -1345,7 +1339,6 @@ class Client(object):
 
         run = True
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         while run:
             if self._thread_terminate is True:
                 break
@@ -1703,12 +1696,9 @@ class Client(object):
         remaining_mult = 1
         packet = MQTTPacket()
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         with (yield self._read_lock.acquire()):
             with io_exception_context(self):
-                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 command = yield self._read_bytes(1)
-                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 if len(command) == 0:
                     raise gen.Return(1)
                 command, = struct.unpack("!B", command)
@@ -1751,10 +1741,8 @@ class Client(object):
     @gen.coroutine
     def _packet_write(self, packet):
         with io_exception_context(self):
-            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             yield self._write(packet.payload)
 
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
             self._callback_mutex.acquire()
             if self.on_publish:
@@ -2175,7 +2163,6 @@ class Client(object):
         return MQTT_ERR_SUCCESS
 
     def _handle_connack(self, packet):
-        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         if self._strict_protocol:
             if packet.remaining_length != 2:
                 return MQTT_ERR_PROTOCOL

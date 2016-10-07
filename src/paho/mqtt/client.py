@@ -852,7 +852,6 @@ class Client(object):
         self.connected.set()
         self._send_connect(self._keepalive, self._clean_session)
 
-    @gen.coroutine
     def loop(self, timeout=1.0, max_packets=1):
         """Process network events.
 
@@ -878,7 +877,7 @@ class Client(object):
 
         self.io_loop.spawn_callback(self.loop_write, max_packets)
         self.io_loop.spawn_callback(self.loop_read, max_packets)
-        self.attach_periodic_callback(self.loop_misc, 1000)
+        # self.attach_periodic_callback(self.loop_misc, 1000)
 
         # if self._sock:
         #     rc = yield self.loop_read(max_packets)
@@ -1147,19 +1146,19 @@ class Client(object):
         yield self.connected.wait()
 
         if self._sock is None:
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             raise gen.Return(MQTT_ERR_NO_CONN)
 
-        max_packets = len(self._out_messages) + len(self._in_messages)
-        if max_packets < 1:
-            max_packets = 1
-
-        for _ in range(0, max_packets):
+        while not self._sock.closed():
             rc = yield self._packet_read()
             if rc > 0:
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 raise gen.Return(MQTT_ERR_SUCCESS)
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         raise gen.Return(MQTT_ERR_SUCCESS)
 
     @gen.coroutine
@@ -1176,21 +1175,21 @@ class Client(object):
         yield self.connected.wait()
 
         if self._sock is None:
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
             raise gen.Return(MQTT_ERR_NO_CONN)
 
-        max_packets = self._out_packet.qsize() + 1
-        if max_packets < 1:
-            max_packets = 1
-
-        for _ in range(0, max_packets):
+        while not self._sock.closed():
             packet = yield self._out_packet.get()
             rc = yield self._packet_write(packet)
             self._out_packet.task_done()
             if rc > 0:
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 raise gen.Return(self._loop_rc_handle(rc))
             elif rc == MQTT_ERR_AGAIN:
+                import pdb; pdb.set_trace()  # XXX BREAKPOINT
                 raise gen.Return(MQTT_ERR_SUCCESS)
 
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         raise gen.Return(MQTT_ERR_SUCCESS)
 
     def want_write(self):
@@ -1199,42 +1198,45 @@ class Client(object):
         """
         return self._out_packet.qsize() > 0
 
-    @gen.coroutine
-    def loop_misc(self):
-        """Process miscellaneous network events. Use in place of calling loop() if you
-        wish to call select() or equivalent on.
+    ## @gen.coroutine
+    ## def loop_misc(self):
+    ##     """Process miscellaneous network events. Use in place of calling loop() if you
+    ##     wish to call select() or equivalent on.
 
-        Do not use if you are using the threaded interface loop_start()."""
-        yield self._connected.wait()
+    ##     Do not use if you are using the threaded interface loop_start()."""
+    ##     yield self._connected.wait()
 
-        if self._sock is None:
-            raise gen.Return(MQTT_ERR_NO_CONN)
+    ##     if self._sock is None:
+    ##         import pdb; pdb.set_trace()  # XXX BREAKPOINT
+    ##         raise gen.Return(MQTT_ERR_NO_CONN)
 
-        now = time_func()
-        self._check_keepalive()
-        if self._last_retry_check+1 < now:
-            # Only check once a second at most
-            self._message_retry_check()
-            self._last_retry_check = now
+    ##     now = time_func()
+    ##     self._check_keepalive()
+    ##     if self._last_retry_check+1 < now:
+    ##         # Only check once a second at most
+    ##         self._message_retry_check()
+    ##         self._last_retry_check = now
 
-        if self._ping_t > 0 and now - self._ping_t >= self._keepalive:
-            # client->ping_t != 0 means we are waiting for a pingresp.
-            # This hasn't happened in the keepalive time so we should disconnect.
-            self.close()
+    ##     if self._ping_t > 0 and now - self._ping_t >= self._keepalive:
+    ##         # client->ping_t != 0 means we are waiting for a pingresp.
+    ##         # This hasn't happened in the keepalive time so we should disconnect.
+    ##         self.close()
 
-            self._callback_mutex.acquire()
-            if self._state == mqtt_cs_disconnecting:
-                rc = MQTT_ERR_SUCCESS
-            else:
-                rc = 1
-            if self.on_disconnect:
-                self._in_callback = True
-                self.on_disconnect(self, self._userdata, rc)
-                self._in_callback = False
-            self._callback_mutex.release()
-            raise gen.Return(MQTT_ERR_CONN_LOST)
+    ##         self._callback_mutex.acquire()
+    ##         if self._state == mqtt_cs_disconnecting:
+    ##             rc = MQTT_ERR_SUCCESS
+    ##         else:
+    ##             rc = 1
+    ##         if self.on_disconnect:
+    ##             self._in_callback = True
+    ##             self.on_disconnect(self, self._userdata, rc)
+    ##             self._in_callback = False
+    ##         self._callback_mutex.release()
+    ##         import pdb; pdb.set_trace()  # XXX BREAKPOINT
+    ##         raise gen.Return(MQTT_ERR_CONN_LOST)
 
-        raise gen.Return(MQTT_ERR_SUCCESS)
+    ##     import pdb; pdb.set_trace()  # XXX BREAKPOINT
+    ##     raise gen.Return(MQTT_ERR_SUCCESS)
 
     def max_inflight_messages_set(self, inflight):
         """Set the maximum number of messages with QoS>0 that can be part way
@@ -1354,41 +1356,46 @@ class Client(object):
             else:
                 break
 
-        while run:
-            rc = MQTT_ERR_SUCCESS
-            while rc == MQTT_ERR_SUCCESS:
-                rc = yield self.loop(timeout, max_packets)
-                # We don't need to worry about locking here, because we've
-                # either called loop_forever() when in single threaded mode, or
-                # in multi threaded mode when loop_stop() has been called and
-                # so no other threads can access _current_out_packet,
-                # _out_packet or _messages.
-                if (self._thread_terminate is True
-                        and self._out_packet.qsize() == 0
-                        and len(self._out_messages) == 0):
+        rc = self.loop(timeout, max_packets)
 
-                    rc = 1
-                    run = False
+        # while run:
+        #     rc = MQTT_ERR_SUCCESS
+        #     while rc == MQTT_ERR_SUCCESS:
+        #         rc = self.loop(timeout, max_packets)
+        #         import pdb; pdb.set_trace()  # XXX BREAKPOINT
+        #         # We don't need to worry about locking here, because we've
+        #         # either called loop_forever() when in single threaded mode, or
+        #         # in multi threaded mode when loop_stop() has been called and
+        #         # so no other threads can access _current_out_packet,
+        #         # _out_packet or _messages.
+        #         if (self._thread_terminate is True
+        #                 and self._out_packet.qsize() == 0
+        #                 and len(self._out_messages) == 0):
 
-            self._state_mutex.acquire()
-            if self._state == mqtt_cs_disconnecting or run is False or self._thread_terminate is True:
-                run = False
-                self._state_mutex.release()
-            else:
-                self._state_mutex.release()
-                yield gen.sleep(1)
+        #             rc = 1
+        #             run = False
 
-                self._state_mutex.acquire()
-                if self._state == mqtt_cs_disconnecting or run is False or self._thread_terminate is True:
-                    run = False
-                    self._state_mutex.release()
-                # else:
-                #     self._state_mutex.release()
-                #     try:
-                #         self.reconnect()
-                #     except socket.error as err:
-                #         pass
+        #     self._state_mutex.acquire()
+        #     if self._state == mqtt_cs_disconnecting or run is False or self._thread_terminate is True:
+        #         run = False
+        #         self._state_mutex.release()
+        #     else:
+        #         self._state_mutex.release()
+        #         import pdb; pdb.set_trace()  # XXX BREAKPOINT
+        #         yield gen.sleep(1)
 
+        #         self._state_mutex.acquire()
+        #         if self._state == mqtt_cs_disconnecting or run is False or self._thread_terminate is True:
+        #             run = False
+        #             self._state_mutex.release()
+        #         else:
+        #             self._state_mutex.release()
+        #         #     try:
+        #         #         self.reconnect()
+        #         #     except socket.error as err:
+        #         #         pass
+
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         raise gen.Return(rc)
 
     def loop_start(self):
@@ -1676,7 +1683,7 @@ class Client(object):
         return self._sock.read_bytes(num_bytes)
 
     def _write(self, msg):
-        return self._sock.write(str(msg))
+        return self._sock.write(msg)
 
     @gen.coroutine
     def _packet_read(self):
@@ -1738,10 +1745,22 @@ class Client(object):
 
         raise gen.Return(rc)
 
+    # def handle_write_timeout(self):
+    #     try:
+    #         if not self._ping_task:
+    #             self.logger.debug("Scheduling Ping")
+    #             self._ping_task = ensure_future(self.mqtt_ping())
+    #     except BaseException as e:
+    #         self.logger.debug("Exception ignored in ping task: %r" % e)
+
     @gen.coroutine
     def _packet_write(self, packet):
         with io_exception_context(self):
-            yield self._write(packet.payload)
+            yield self._write(str(packet.payload))
+
+        # if self._keepalive_task:
+        #     self._keepalive_task.cancel()
+        #     self._keepalive_task = self._loop.call_later(self.keepalive_timeout, self.handle_write_timeout)
 
         if (packet.command & 0xF0) == PUBLISH and packet.qos == 0:
             self._callback_mutex.acquire()
@@ -1782,35 +1801,36 @@ class Client(object):
             level_std = LOGGING_LEVEL[level]
             self._logger.log(level_std, fmt, *args)
 
-    def _check_keepalive(self):
-        if self._keepalive == 0:
-            return MQTT_ERR_SUCCESS
-
-        now = time_func()
-        self._msgtime_mutex.acquire()
-        last_msg_out = self._last_msg_out
-        last_msg_in = self._last_msg_in
-        self._msgtime_mutex.release()
-        if self._sock is not None and (now - last_msg_out >= self._keepalive or now - last_msg_in >= self._keepalive):
-            if self._state == mqtt_cs_connected and self._ping_t == 0:
-                self._send_pingreq()
-                self._msgtime_mutex.acquire()
-                self._last_msg_out = now
-                self._last_msg_in = now
-                self._msgtime_mutex.release()
-            else:
-                self.close()
-
-                if self._state == mqtt_cs_disconnecting:
-                    rc = MQTT_ERR_SUCCESS
-                else:
-                    rc = 1
-                self._callback_mutex.acquire()
-                if self.on_disconnect:
-                    self._in_callback = True
-                    self.on_disconnect(self, self._userdata, rc)
-                    self._in_callback = False
-                self._callback_mutex.release()
+    # def _check_keepalive(self):
+    #     if self._keepalive == 0:
+    #         return MQTT_ERR_SUCCESS
+    #
+    #     now = time_func()
+    #     self._msgtime_mutex.acquire()
+    #     last_msg_out = self._last_msg_out
+    #     last_msg_in = self._last_msg_in
+    #     self._msgtime_mutex.release()
+    #
+    #     if self._sock is not None and (now - last_msg_out >= self._keepalive or now - last_msg_in >= self._keepalive):
+    #         if self._state == mqtt_cs_connected and self._ping_t == 0:
+    #             self._send_pingreq()
+    #             self._msgtime_mutex.acquire()
+    #             self._last_msg_out = now
+    #             self._last_msg_in = now
+    #             self._msgtime_mutex.release()
+    #         else:
+    #             self.close()
+    #
+    #             if self._state == mqtt_cs_disconnecting:
+    #                 rc = MQTT_ERR_SUCCESS
+    #             else:
+    #                 rc = 1
+    #             self._callback_mutex.acquire()
+    #             if self.on_disconnect:
+    #                 self._in_callback = True
+    #                 self.on_disconnect(self, self._userdata, rc)
+    #                 self._in_callback = False
+    #             self._callback_mutex.release()
 
     def _mid_generate(self):
         self._last_mid += 1
@@ -2112,8 +2132,8 @@ class Client(object):
 
         self._out_packet.put_nowait(mpkt)
 
-        if not self._in_callback and self._thread is None:
-            return self.loop_write()
+        # if not self._in_callback and self._thread is None:
+        #     return self.loop_write()
 
         return MQTT_ERR_SUCCESS
 

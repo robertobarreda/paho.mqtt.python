@@ -21,15 +21,6 @@ import errno
 import platform
 import random
 import socket
-HAVE_SSL = True
-try:
-    import ssl
-    cert_reqs = ssl.CERT_REQUIRED
-    tls_version = ssl.PROTOCOL_TLSv1
-except:
-    HAVE_SSL = False
-    cert_reqs = None
-    tls_version = None
 import struct
 import sys
 import threading
@@ -39,19 +30,7 @@ import base64
 import string
 import hashlib
 import logging
-try:
-    # Use monotionic clock if available
-    time_func = time.monotonic
-except AttributeError:
-    time_func = time.time
 
-HAVE_DNS = True
-try:
-    import dns.resolver
-except ImportError:
-    HAVE_DNS = False
-
-from functools import wraps
 from tornado import gen
 from tornado import iostream
 from tornado import locks
@@ -61,15 +40,37 @@ from tornado.tcpclient import TCPClient
 
 from .matcher import MQTTMatcher
 
+HAVE_SSL = True
+try:
+    import ssl
+    cert_reqs = ssl.CERT_REQUIRED
+    tls_version = ssl.PROTOCOL_TLSv1
+except:
+    HAVE_SSL = False
+    cert_reqs = None
+    tls_version = None
+
+try:
+    # Use monotionic clock if available
+    time_func = time.monotonic
+except AttributeError:
+    time_func = time.time
+
+# HAVE_DNS = True
+# try:
+#     import dns.resolver
+# except ImportError:
+#     HAVE_DNS = False
+
 if platform.system() == 'Windows':
     EAGAIN = errno.WSAEWOULDBLOCK
 else:
     EAGAIN = errno.EAGAIN
 
-VERSION_MAJOR=1
-VERSION_MINOR=2
-VERSION_REVISION=0
-VERSION_NUMBER=(VERSION_MAJOR*1000000+VERSION_MINOR*1000+VERSION_REVISION)
+VERSION_MAJOR = 1
+VERSION_MINOR = 2
+VERSION_REVISION = 0
+VERSION_NUMBER = (VERSION_MAJOR*1000000+VERSION_MINOR*1000+VERSION_REVISION)
 
 MQTTv31 = 3
 MQTTv311 = 4
@@ -80,7 +81,6 @@ PROTOCOL_NAMEv311 = "MQTT"
 # define some alias for python2 compatibility
 unicode = str
 basestring = str
-
 
 # Message types
 CONNECT = 0x10
@@ -97,6 +97,11 @@ UNSUBACK = 0xB0
 PINGREQ = 0xC0
 PINGRESP = 0xD0
 DISCONNECT = 0xE0
+
+# QoS types
+QOS_0 = 0x00
+QOS_1 = 0x01
+QOS_2 = 0x02
 
 # Log levels
 MQTT_LOG_INFO = 0x01
@@ -128,7 +133,7 @@ mqtt_cs_connect_async = 3
 
 # Message state
 mqtt_ms_invalid = 0
-mqtt_ms_publish= 1
+mqtt_ms_publish = 1
 mqtt_ms_wait_for_puback = 2
 mqtt_ms_wait_for_pubrec = 3
 mqtt_ms_resend_pubrel = 4
@@ -157,10 +162,6 @@ MQTT_ERR_UNKNOWN = 13
 MQTT_ERR_ERRNO = 14
 MQTT_ERR_QUEUE_SIZE = 15
 
-if sys.version_info[0] < 3:
-    sockpair_data = "0"
-else:
-    sockpair_data = b"0"
 
 def error_string(mqtt_errno):
     """Return the error string associated with an mqtt error number."""
@@ -376,7 +377,6 @@ def io_exception_context(ctx):
         raise MQTTTransportException(
             type=MQTTTransportException.UNKNOWN,
             message=str(e))
-
 
 
 class Client(object):

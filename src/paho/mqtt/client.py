@@ -381,9 +381,13 @@ class MQTTTransportException(Exception):
 
 
 @contextlib.contextmanager
-def io_exception_context(ctx):
+def io_exception_context(self):
     try:
         yield
+    except iostream.StreamClosedError:
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
+        # if self.auto_reconnect:
+        self.io_loop.call_later(1, self.reconnect)
     except (socket.error, IOError) as e:
         raise MQTTTransportException(
             type=MQTTTransportException.END_OF_FILE,
@@ -865,12 +869,19 @@ class Client(object):
         #         sock = WebsocketWrapper(sock, self._host, self._port, False)
 
         self._client = TCPClient(io_loop=self.io_loop)
-        self._sock = yield self._client.connect(self._host, self._port, ssl_options=_ssl_options)
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
+        try:
+            self._sock = yield self._client.connect(self._host, self._port, ssl_options=_ssl_options)
+        except (iostream.StreamClosedError, socket.error):
+            import pdb; pdb.set_trace()  # XXX BREAKPOINT
+            raise
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         self._sock.set_nodelay(True)
         self._send_connect(self._keepalive, self._clean_session)
-        if self._keepalive:
-            self._keepalive_task = self.io_loop.call_later(
-                self._keepalive, self.handle_write_timeout)
+        # if self._keepalive:
+        #     self._keepalive_task = self.io_loop.call_later(
+        #         self._keepalive, self.handle_write_timeout)
+        import pdb; pdb.set_trace()  # XXX BREAKPOINT
         self.connected.set()
 
     def _on_connect_failed(self, sock):
@@ -911,8 +922,8 @@ class Client(object):
         if timeout < 0.0:
             raise ValueError('Invalid timeout.')
 
-        self.io_loop.spawn_callback(self.loop_write, max_packets)
-        self.io_loop.spawn_callback(self.loop_read, max_packets)
+        self.io_loop.add_callback(self.loop_write, max_packets)
+        self.io_loop.add_callback(self.loop_read, max_packets)
         # self.attach_periodic_callback(self.loop_misc, 1000)
         self.attach_periodic_callback(self._message_retry_check, 1000)
 
